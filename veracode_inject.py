@@ -70,7 +70,6 @@ DEFAULTS = {
     "sast": "auto",              # auto | on | off
     "pipeline": True,            # Pipeline Scan: branch pushes + PRs
     "policy": True,              # Policy Scan: pushes to the default branch
-    "sandboxes": False,          # Sandbox scan: PRs into the default branch
     "sca": "auto",               # auto | on | off
     "iac": "on",                 # on | artifacts | off
     "windows_runner": "windows-latest",  # SCA runner for Windows-only .NET/C++ repos; "off" disables
@@ -83,8 +82,8 @@ CONFIG_KEYS = set(DEFAULTS)
 
 BEGIN = "# >>> veracode-pipeline-inject >>> managed block: re-run the tool to update it"
 END_PREFIX = "# <<< veracode-pipeline-inject <<<"
-JOB_IDS = ("veracode-prepare", "veracode-pipeline-scan", "veracode-policy-scan",
-           "veracode-sandbox-scan", "veracode-sca", "veracode-iac")
+JOB_IDS = ("veracode-prepare", "veracode-pipeline-scan", "veracode-policy-scan", "veracode-sca",
+           "veracode-iac")
 UPLOAD_STEP_NAME = "Upload build output for Veracode"
 BUILD_ARTIFACT = "veracode-build"
 TODO_PATH = "TODO-set-your-build-output-path"
@@ -263,8 +262,10 @@ CODE_EXTENSIONS = {
     ".mm": "Objective-C", ".cbl": "COBOL", ".cob": "COBOL", ".rs": "Rust", ".ex": "Elixir",
     ".exs": "Elixir",
 }
+# Agent-based SCA support: https://docs.veracode.com/r/Agent_Based_Scans (Supported languages).
 SCA_LANGUAGES = {"C#", "F#", "Visual Basic .NET", "ASP.NET", "Go", "Java", "Groovy", "JavaScript",
-                 "TypeScript", "Vue", "JSX", "Svelte", "Kotlin", "PHP", "Python", "Scala"}
+                 "TypeScript", "Vue", "JSX", "Svelte", "Kotlin", "PHP", "Python", "Scala", "Ruby",
+                 "Swift", "Objective-C", "C", "C++"}
 SCA_MANIFEST_NAMES = {
     "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
     "gradle.lockfile", "build.sbt", "ivy.xml", "build.xml", "gradlew", "mvnw", "libs.versions.toml",
@@ -282,8 +283,10 @@ SCA_MANIFEST_NAMES = {
 }
 SCA_MANIFEST_SUFFIXES = (".csproj", ".fsproj", ".vbproj", ".sln", ".slnx", ".nuspec", ".jar", ".dll", ".sbt")
 # Present but never resolvable on their own (the agent fails with "no build system found").
+# Podfile alone needs `pod install`, which Linux runners don't have; Podfile.lock is enough.
 SCA_SUPPORTING_NAMES = {"global.json", "directory.build.props", "directory.packages.props", "gradlew",
-                        "mvnw", "libs.versions.toml", "setup.cfg", "pnpm-workspace.yaml", "go.work.sum"}
+                        "mvnw", "libs.versions.toml", "setup.cfg", "pnpm-workspace.yaml", "go.work.sum",
+                        "podfile"}
 SCA_SUPPORTING_SUFFIXES = (".sln", ".slnx")
 SCA_IGNORED_NAMES = {"gradle-wrapper.jar", "maven-wrapper.jar"}
 SCA_ECOSYSTEMS = [
@@ -304,7 +307,15 @@ SCA_ECOSYSTEMS = [
     ("dotnet", {"C#", "F#", "Visual Basic .NET", "ASP.NET"},
      {"packages.config", "project.json", "directory.build.props", "directory.packages.props",
       "global.json"}, (".csproj", ".fsproj", ".vbproj", ".sln", ".slnx", ".nuspec", ".dll")),
+    ("ruby", {"Ruby"}, {"gemfile", "gemfile.lock"}, ()),
+    ("cocoapods", {"Swift", "Objective-C"}, {"podfile", "podfile.lock"}, ()),
 ]
+# C/C++: the agent builds with Make on Linux. The makefile needs a compiler string and a clean target.
+# https://docs.veracode.com/r/Find_vulnerabilities_in_Cplus
+SCA_MAKEFILES = ("gnumakefile", "makefile")  # the agent's lookup order
+MAKE_COMPILER_RE = re.compile(r"gcc|g\+\+|clang|cmake", re.I)
+MAKE_CLEAN_RE = re.compile(r"^clean\s*:", re.M)
+MAKE_APPLE_RE = re.compile(r"\b(?:xcodebuild|xcrun|notarytool)\b")  # macOS-only build; the agent's make runs on Linux
 # Manifests that show a first-party source-language project (not vendored static JS).
 SOURCE_PROJECT_NAMES = {"package.json", "requirements.txt", "pyproject.toml", "setup.py", "pipfile",
                         "go.mod", "composer.json", "gemfile"}
@@ -366,6 +377,7 @@ class Detection:
     sast_reason: str = ""
     sca: bool = False
     sca_reason: str = ""
+    sca_make: str = ""        # makefile the agent builds (C/C++), if any
     iac_artifacts: list = field(default_factory=list)
     windows: str | None = None     # evidence for a Windows SCA runner
     runner_reason: str = ""
@@ -540,6 +552,21 @@ def detect(paths: list[str], linguist: dict | None = None, truncated: bool = Fal
             other.add(name)
         if base in SOURCE_PROJECT_NAMES or is_req:
             det.source_projects.append(lp)
+    make_reason = ""
+    if langs & {"C", "C++"}:
+        makefiles = sorted((p for p, lp, base in entries if base in SCA_MAKEFILES),
+                           key=lambda p: (p.count("/"), SCA_MAKEFILES.index(p.rsplit("/", 1)[-1].lower())))
+        if makefiles:
+            mk = makefiles[0]
+            text = read_project(mk) if read_project else None
+            if text is not None and MAKE_APPLE_RE.search(text):
+                make_reason = f"{mk} builds with Xcode (macOS); the agent's Make build runs on Linux"
+            elif text is None or (MAKE_COMPILER_RE.search(text) and MAKE_CLEAN_RE.search(text)):
+                enabling.add(mk.rsplit("/", 1)[-1])
+                ecos.add("c/c++ make")
+                det.sca_make = mk
+            else:
+                make_reason = f"{mk} has no gcc/g++/clang/CMake build or no clean target, which the agent needs"
     det.sca = bool(enabling) or truncated
     if enabling:
         det.sca_reason = f"manifests: {', '.join(sorted(enabling)[:5])} ({', '.join(sorted(ecos))})"
@@ -548,6 +575,8 @@ def detect(paths: list[str], linguist: dict | None = None, truncated: bool = Fal
     else:
         det.sca_reason = "off: no supported dependency manifest" + (
             f" (only {', '.join(sorted(other)[:5])}, not resolvable on their own)" if other else "")
+        if make_reason:
+            det.sca_reason += f"; {make_reason}"
 
     # IaC artifacts (IaC/Secrets runs everywhere unless iac: artifacts/off).
     arts = set()
@@ -581,6 +610,9 @@ def detect(paths: list[str], linguist: dict | None = None, truncated: bool = Fal
     if strong and corroborated:
         det.windows = ", ".join(sorted(strong)[:4])
         det.runner_reason = f"Windows build signals: {det.windows}"
+        if det.sca_make and ecos == {"c/c++ make"}:
+            det.sca, det.sca_make = False, ""
+            det.sca_reason = "off: C/C++ SCA builds with Make on Linux only, and this is a Windows build"
     elif strong:
         det.runner_reason = "Windows-like files without .NET/C++ code; kept on Linux"
     elif weak:
@@ -911,7 +943,7 @@ def scan_decisions(det: Detection, cfg: dict) -> dict:
     if cfg["sast"] == "off":
         out["sast"] = (False, "off by config")
     elif not selected_scans(cfg):
-        out["sast"] = (False, "off: no SAST scan selected (pipeline, policy, sandboxes)")
+        out["sast"] = (False, "off: no SAST scan selected (pipeline, policy)")
     elif cfg["sast"] == "on" and not det.sast:
         out["sast"] = (True, f"forced on by config ({det.sast_reason})")
     else:
@@ -950,12 +982,6 @@ def make_plan(wf: Workflow, det: Detection, cfg: dict) -> Plan:
             plan.notes.append("No pull_request trigger: PR gate scans will not run")
         if "push" not in trig:
             plan.notes.append("No push trigger: the policy scan on the default branch will not run")
-        if dec["sast"][0] and "sandboxes" in plan.sast_scans:
-            if "pull_request" not in trig:
-                plan.notes.append("Sandbox scans run on pull requests, but the workflow has no pull_request trigger")
-            else:
-                plan.notes.append("Sandboxes are named after the PR source branch and are not deleted when the PR "
-                                  "closes; remove stale ones in the Veracode Platform")
         if "pull_request" in trig and not push_runs_on(wf, cfg["branch"]):
             plan.notes.append(f"Pushes to `{cfg['branch']}` don't trigger this workflow; open a PR from it to test")
     conc = wf.data.get("concurrency")
@@ -1089,16 +1115,14 @@ ON_BRANCH_PUSH = "(github.event_name == 'push' && github.ref_name != github.even
 ON_DEFAULT_PUSH = "(github.event_name == 'push' && github.ref_name == github.event.repository.default_branch)"
 ON_PR_TO_DEFAULT = "(github.event_name == 'pull_request' && github.base_ref == github.event.repository.default_branch)"
 ON_ANY_PR = "github.event_name == 'pull_request'"
-SAST_SCANS = ("pipeline", "policy", "sandboxes")
+SAST_SCANS = ("pipeline", "policy")
 SAST_SCAN_EVENTS = {
     "pipeline": [ON_ANY_PR, ON_BRANCH_PUSH],
     "policy": [ON_DEFAULT_PUSH],
-    "sandboxes": [ON_PR_TO_DEFAULT],
 }
 SCAN_LABELS = {
     "pipeline": "Pipeline Scan on branch pushes and PRs",
     "policy": "Policy Scan on pushes to the default branch",
-    "sandboxes": "Sandbox scan (sandbox = PR source branch) on PRs into the default branch",
 }
 
 
@@ -1224,24 +1248,6 @@ def render_jobs(plan: Plan, cfg: dict, actions: dict) -> list[str]:
                 "        createprofile: true",
                 "        filepath: veracode-units",
                 "        version: ${{ github.ref_name }}-${{ github.run_number }}-${{ github.run_attempt }}"]
-
-    if plan.sast_mode != "off" and "sandboxes" in scans:
-        out += ["veracode-sandbox-scan:", "  name: Veracode Sandbox Scan", "  needs: veracode-prepare",
-                "  if: >-", f"    {has_units} &&", f"    {ON_PR_TO_DEFAULT}",
-                f"  runs-on: {runner}", *perms,
-                "  # One upload per sandbox at a time; a newer commit replaces an unfinished scan.",
-                "  concurrency:", "    group: veracode-sandbox-${{ github.repository }}-${{ github.head_ref }}",
-                "    cancel-in-progress: false",
-                "  steps:", *_download_units(actions),
-                "    - name: Veracode Upload and Scan (sandbox)", f"      uses: {actions['policy']}", "      with:",
-                *_creds(),
-                "        appname: ${{ secrets.VERACODE_APP_NAME || github.repository }}",
-                "        createprofile: true",
-                "        createsandbox: true",
-                "        sandboxname: ${{ github.head_ref }}",
-                "        deleteincompletescan: true",
-                "        filepath: veracode-units",
-                "        version: ${{ github.head_ref }}-${{ github.run_number }}-${{ github.run_attempt }}"]
 
     if plan.sca:
         sca_runner = _yq(plan.sca_runner) if plan.sca_runner else runner
@@ -1396,7 +1402,7 @@ def _check_keys(values: dict, where: str) -> None:
         raise ToolError(f"unknown config keys in {where}: {', '.join(sorted(unknown))}")
     if "artifact_path" in values and isinstance(values["artifact_path"], str):
         values["artifact_path"] = [values["artifact_path"]]
-    for key in ("pipeline", "policy", "sandboxes", "sca_blocking", "iac_blocking", "strict"):
+    for key in ("pipeline", "policy", "sca_blocking", "iac_blocking", "strict"):
         if key in values and not isinstance(values[key], bool):
             raise ToolError(f"{where}.{key} must be true or false")
     for key, allowed in (("sast", {"auto", "on", "off"}), ("sca", {"auto", "on", "off"}),
@@ -2198,8 +2204,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Pipeline Scan on branch pushes and PRs (default with --policy when no scan flag is given)")
     p.add_argument("--policy", action="store_true", default=None,
                    help="Policy Scan (Upload and Scan) on pushes to the default branch")
-    p.add_argument("--sandboxes", action="store_true", default=None,
-                   help="Sandbox scan on PRs into the default branch (sandbox = PR source branch)")
     p.add_argument("--sca", choices=["auto", "on", "off"])
     p.add_argument("--iac", choices=["on", "artifacts", "off"],
                    help="on: every repo (secret scanning); artifacts: only repos with IaC/container files")
@@ -2252,7 +2256,7 @@ def main(argv: list[str] | None = None) -> int:
         "sca_blocking": args.sca_blocking, "iac_blocking": args.iac_blocking,
     }
     # Any scan flag selects exactly the given scans.
-    if args.pipeline or args.policy or args.sandboxes:
+    if args.pipeline or args.policy:
         cli_cfg.update({s: bool(getattr(args, s)) for s in SAST_SCANS})
     try:
         return run_targets(args, cli_cfg) if args.target else run_file(args, cli_cfg)
