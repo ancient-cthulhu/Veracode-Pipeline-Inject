@@ -28,7 +28,7 @@ gh auth login -s workflow                # or export GH_TOKEN (repo + workflow s
 python veracode_inject.py --target my-org --dry-run
 ```
 
-Writing a workflow file needs a token with the `repo` and `workflow` scopes; a fine-grained token needs **Contents** and **Workflows** read/write. `--dry-run` only needs read access. The token comes from `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`. For GitHub Enterprise Server, set `GITHUB_API_URL` (for example `https://ghe.example.com/api/v3`).
+Writing a workflow file needs a token with the `repo` and `workflow` scopes; a fine-grained token or GitHub App needs **Contents** and **Workflows** read/write. `--dry-run` only needs read access. The token comes from `--token-command`, then `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`. For GitHub Enterprise Server, set `GITHUB_API_URL` (for example `https://ghe.example.com/api/v3`). Tokens, permissions and rate limits: [GitHub API use](docs/github-api.md).
 
 ## Examples
 
@@ -208,9 +208,10 @@ Repository or organization secrets both work. Fork PRs don't receive secrets, so
 3. **Canary:** `--limit 20 --report rollout.csv`. This changes the first 20 repos only. Open a PR in a few of them and check the runs.
 4. **Everything else:** `--report rollout.csv --resume --quiet`. Repos already done in the report are skipped, and new rows are appended.
 
-- **Resume:** the report is written row by row. If a run is interrupted (Ctrl+C, network failure, or an expired token, which exits with code 3), re-run the same command with `--resume`.
-- **Rate limits:** the tool waits for the hourly limit to reset instead of failing, and pauses between writes to stay under GitHub's secondary rate limit.
-- **API budget:** about 10–15 calls per repo, plus 2 writes per changed repo; `--detect-only` uses about 4. A personal access token gets 5,000 calls an hour, which is roughly 400 repos an hour. A GitHub App installation token on GitHub Enterprise Cloud gets up to 15,000. The summary prints the API calls used.
+- **Resume:** the report is written row by row. If a run is interrupted (Ctrl+C, network failure, or an expired token, which exits with code 3), re-run the same command with `--resume`. Only repositories completed in the same mode are skipped, so a dry-run report doesn't stop a real run.
+- **Rate limits:** the tool waits for the hourly limit to reset instead of failing, honours `Retry-After` on secondary limits, and keeps writes under GitHub's 80 a minute and 500 an hour. Retries are bounded and counted in the summary.
+- **API budget:** one GraphQL query reads every workflow file of a repo, so a dry run costs about 4 REST calls plus 1 GraphQL query per repo, whatever the number of workflows (before: ~20). That's about 1,000 repos an hour on a personal access token. Changes are limited by GitHub to about 250 repos an hour (2 writes each). The summary and the report's `api_calls` column show the real cost. Details: [GitHub API use](docs/github-api.md).
+- **Long runs:** GitHub App installation tokens last an hour; `--token-command` gets a new one when the old one expires.
 - **Branch safety:** an existing branch is only updated when every commit on it came from this tool, and its workflow matches the default branch outside the managed blocks. Otherwise the repo is skipped with the reason, and `--force` overrides. Nothing is ever written to the default branch.
 - **Per-repo isolation:** a failure in one repo is recorded in the report and the run continues.
 
@@ -251,8 +252,10 @@ Repository or organization secrets both work. Fork PRs don't receive secrets, so
 | `--report` | | CSV report of every repository with plan, TODOs and the reason for each scan, written row by row (targets only) |
 | `--resume` | off | With `--report`: skip repositories already completed in that report and append to it |
 | `--limit` | | Stop after changing N repositories (canary) |
+| `--token-command` | | Command that prints a GitHub token. Run at the start and again when the token expires (GitHub App tokens last 1 hour). |
+| `--writes-per-hour` | 500 | Content-creating requests per hour (GitHub's documented limit). Lower it when other automation shares the account. |
 | `--quiet` | off | One line per repository |
-| `--debug` | off | Print the traceback for internal errors |
+| `--debug` | off | Log every API request (method, path, status, time, remaining budget; never the token) and print tracebacks for internal errors |
 | `--source-dir`, `--out` | | Local mode: repo root for detection, and output file |
 
 ### Config file
@@ -288,7 +291,7 @@ Command-line flags override the config.
 | 0 | Every repository was committed, is already up to date, would change (dry run) or was detected (`--detect-only`) |
 | 1 | At least one repository was skipped or failed. The output says why. |
 | 2 | Usage, config or detection error |
-| 3 | GitHub API error: authentication failed, or the token expired mid-run (re-run with `--resume`) |
+| 3 | GitHub API error: authentication failed, the token expired mid-run, or the same 403 hit 10 repositories in a row (re-run with `--resume`) |
 | 130 | Interrupted (Ctrl+C). Re-run with `--resume`. |
 
 ## Troubleshooting
@@ -305,7 +308,10 @@ Command-line flags override the config.
 | `branch ... has N commit(s) not made by this tool` | Someone already uses `veracode/integration` for other work | `--branch veracode/scans` (or another name), or `--force` to add to it |
 | `... differs from main outside the managed blocks` | The workflow changed on the default branch after the tool's branch was made, or someone edited the branch | Merge the default branch into the tool's branch, delete the branch, or `--force` to rebuild it from the default branch |
 | `failed (repository not found or no access)` | A misspelled `org/repo`, or the token can't see it | Fix the target. The rest of the run continues. |
-| `Stopped: GitHub rejected the token` | The token expired (GitHub App tokens last 1 hour) | Get a new token and re-run with `--resume` |
+| `Stopped: GitHub rejected the token` | The token expired (GitHub App tokens last 1 hour) | Re-run with `--resume`, and use `--token-command` for long runs |
+| `Stopped: the same error on 10 repositories in a row (HTTP 403 ...)` | The token lacks a permission everywhere (the message names it) | Fix the token's permissions, then `--resume` |
+| `... pacing writes (500 content-creating requests an hour)` | GitHub limits content creation; each changed repo needs 2 writes | Expected on large rollouts: about 250 changes an hour |
+| `... GraphQL API unavailable; using REST only` | The server or a proxy rejects GraphQL | Nothing to do; the run continues over REST and uses more calls |
 | `FAIL actions policy: only local actions allowed` | The org or repo policy blocks marketplace actions | Allow `actions/*` and `veracode/*` in **Settings > Actions > General** |
 | Packaging warning `No scannable build output found` | The upload path matched nothing | Fix `path:` in **Upload build output for Veracode** |
 | Packaging warning `No .pdb files` | .NET built without symbols | Publish with portable PDBs ([.NET packaging](https://docs.veracode.com/r/compilation_net)) |
@@ -322,4 +328,5 @@ Command-line flags override the config.
 | `veracode_inject.py` | The tool (single file) |
 | `examples/veracode-inject.yml` | Example config |
 | `docs/how-it-works.md` | Detection, placement, packaging checks, managed blocks |
+| `docs/github-api.md` | API calls, rate limits, retries, tokens, GHES, resume, security |
 | `requirements.txt` | PyYAML |
