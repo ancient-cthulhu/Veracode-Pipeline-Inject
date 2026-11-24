@@ -13,6 +13,7 @@ import csv
 import difflib
 import fnmatch
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -67,19 +68,23 @@ DEFAULTS = {
     "branch_fail_on_severity": "",
     "runner": "ubuntu-latest",
     "sast": "auto",              # auto | on | off
+    "pipeline": True,            # Pipeline Scan: branch pushes + PRs
+    "policy": True,              # Policy Scan: pushes to the default branch
+    "sandboxes": False,          # Sandbox scan: PRs into the default branch
     "sca": "auto",               # auto | on | off
     "iac": "on",                 # on | artifacts | off
     "windows_runner": "windows-latest",  # SCA runner for Windows-only .NET/C++ repos; "off" disables
     "sca_blocking": False,
     "iac_blocking": False,
     "retention_days": 3,
+    "strict": False,             # skip repos with tied workflow/build-job candidates instead of picking
 }
 CONFIG_KEYS = set(DEFAULTS)
 
 BEGIN = "# >>> veracode-pipeline-inject >>> managed block: re-run the tool to update it"
 END_PREFIX = "# <<< veracode-pipeline-inject <<<"
 JOB_IDS = ("veracode-prepare", "veracode-pipeline-scan", "veracode-policy-scan",
-           "veracode-sca", "veracode-iac")
+           "veracode-sandbox-scan", "veracode-sca", "veracode-iac")
 UPLOAD_STEP_NAME = "Upload build output for Veracode"
 BUILD_ARTIFACT = "veracode-build"
 TODO_PATH = "TODO-set-your-build-output-path"
@@ -115,8 +120,18 @@ def load_yaml(text: str):
     return yaml.load(text, Loader=_Loader)
 
 
+class _PosLoader(_Loader):
+    """Composer for line positions: an alias becomes a placeholder at the alias, not its anchor's node."""
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.AliasEvent):
+            ev = self.get_event()
+            return yaml.ScalarNode("tag:yaml.org,2002:str", f"*{ev.anchor}", ev.start_mark, ev.end_mark)
+        return super().compose_node(parent, index)
+
+
 def compose_yaml(text: str):
-    return yaml.compose(text, Loader=_Loader)
+    return yaml.compose(text, Loader=_PosLoader)
 
 
 def node_get(mapping, key):
@@ -628,8 +643,15 @@ PREFERRED_JOB_RE = re.compile(r"build|package|compile|^ci$", re.I)
 TEST_JOB_RE = re.compile(r"test|check|verify", re.I)
 PREFERRED_WF = ("ci", "build", "main", "pipeline", "build-and-test", "maven", "gradle", "dotnet",
                 "node", "nodejs", "node.js", "python", "python-app", "go")
-DEPRIORITIZED_WF = re.compile(r"codeql|release|deploy|publish|pages|docs|stale|label|dependabot"
-                              r"|lint|sonar|scorecard|veracode", re.I)
+NOT_CI_WF = re.compile(
+    r"codeql|release|deploy|publish|pages|docs?\b|documentation|stale|label|dependabot|lint|sonar|scorecard"
+    r"|veracode|copilot|dependency-review|spell|translat|locale|i18n|l10n|license|changelog|readme|stats"
+    r"|sentry|notif|metadata|update|sync|cache|pre-commit|precommit|phpstan|phpcs|format|prettier|eslint"
+    r"|clippy|rustfmt|codespell|typos|benchmark|bench\b|perf|fuzz|sanitiz|nightly|cron|schedule|docker"
+    r"|image|container|e2e|playwright|cypress|smoke|backport|greet|welcome|triage|assign|auto-merge"
+    r"|size|coverage|wordlist|cla\b|semantic|commitlint|pr-title|review|preview|cleanup", re.I)
+NON_LINUX_RE = re.compile(r"macos|windows|win\d|\bwin\b|mingw|msvc|bsd|solaris|haiku|hurd|illumos|android|ios\b|apple", re.I)
+LINUX_RE = re.compile(r"ubuntu|linux|debian|alpine", re.I)
 
 
 @dataclass
@@ -743,18 +765,34 @@ def anchor_jobs(wf: Workflow) -> list[str]:
     return out
 
 
+def _os_rank(job) -> int:
+    """0 Linux, 1 unknown, 2 only macOS/Windows/other."""
+    if not isinstance(job, dict):
+        return 1
+    runs = json.dumps(job.get("runs-on", ""))
+    strategy = job.get("strategy") if isinstance(job.get("strategy"), dict) else {}
+    text = f"{runs} {json.dumps(strategy.get('matrix', ''))} {job.get('name', '')}"
+    if LINUX_RE.search(text):
+        return 0
+    return 2 if NON_LINUX_RE.search(text) else 1
+
+
+def _job_key(wf: Workflow, j: str) -> tuple:
+    job = wf.jobs.get(j, {})
+    name = f"{j} {job.get('name', '')}" if isinstance(job, dict) else j
+    pref = 0 if PREFERRED_JOB_RE.search(name) else 1 if TEST_JOB_RE.search(name) else 2
+    return (pref, 1 if isinstance(job, dict) and "if" in job else 0, _os_rank(job),
+            1 if re.search(r"release|publish|deploy|nightly", name, re.I) else 0)
+
+
 def _rank_jobs(wf: Workflow, job_ids: list[str]) -> list[str]:
-    def key(j):
-        job = wf.jobs.get(j, {})
-        name = f"{j} {job.get('name', '')}" if isinstance(job, dict) else j
-        pref = 0 if PREFERRED_JOB_RE.search(name) else 1 if TEST_JOB_RE.search(name) else 2
-        return (pref, 1 if isinstance(job, dict) and "if" in job else 0)
-    ranked = sorted(job_ids, key=key)
-    return [j for j in ranked if key(j) == key(ranked[0])] if ranked else []
+    """Best-ranked job ids (ties share the top key), in file order."""
+    ranked = sorted(job_ids, key=lambda j: _job_key(wf, j))
+    return [j for j in ranked if _job_key(wf, j) == _job_key(wf, ranked[0])] if ranked else []
 
 
 def choose_build(wf: Workflow, cfg: dict) -> tuple[BuildMatch | None, list[str]]:
-    """Return (build, candidate job ids when ambiguous)."""
+    """Return (build, other equally ranked job ids). The first job in file order wins ties."""
     matches = [m for m in find_builds(wf) if m.job not in JOB_IDS]
     if cfg.get("build_job"):
         job = cfg["build_job"]
@@ -781,10 +819,8 @@ def choose_build(wf: Workflow, cfg: dict) -> tuple[BuildMatch | None, list[str]]
         return None, []
     jobs = list(dict.fromkeys(m.job for m in matches))
     best = _rank_jobs(wf, jobs)
-    if len(best) > 1:
-        return None, best
     job_matches = [m for m in matches if m.job == best[0]]
-    return job_matches[-1], []
+    return job_matches[-1], best[1:]
 
 
 def existing_upload(wf: Workflow, build: BuildMatch) -> tuple[str, bool] | None:
@@ -821,6 +857,7 @@ class Plan:
     iac: bool = False
     sca_runner: str | None = None   # set when the SCA job needs another runner (Windows)
     reasons: dict = field(default_factory=dict)
+    sast_scans: list = field(default_factory=list)
     todos: list = field(default_factory=list)
     notes: list = field(default_factory=list)
 
@@ -831,6 +868,8 @@ class Plan:
             sast = f"{self.sast_mode} ({self.build.job}: {TOOL_LABEL.get(self.build.tool, self.build.tool)})"
         elif self.sast_mode == "source" and self.needs:
             sast = f"source (after {self.needs})"
+        if self.sast_mode != "off" and self.sast_scans:
+            sast += f" [{'+'.join(self.sast_scans)}]"
         sca = ("on" + (f" ({self.sca_runner})" if self.sca_runner else "")) if self.sca else "off"
         return {"sast": sast, "sca": sca, "iac": "on" if self.iac else "off"}
 
@@ -871,6 +910,8 @@ def scan_decisions(det: Detection, cfg: dict) -> dict:
     out = {}
     if cfg["sast"] == "off":
         out["sast"] = (False, "off by config")
+    elif not selected_scans(cfg):
+        out["sast"] = (False, "off: no SAST scan selected (pipeline, policy, sandboxes)")
     elif cfg["sast"] == "on" and not det.sast:
         out["sast"] = (True, f"forced on by config ({det.sast_reason})")
     else:
@@ -898,6 +939,7 @@ def make_plan(wf: Workflow, det: Detection, cfg: dict) -> Plan:
     plan.iac = dec["iac"][0]
     plan.sca = dec["sca"][0]
     plan.sca_runner = dec["runner"][0]
+    plan.sast_scans = selected_scans(cfg)
 
     trig = wf.triggers()
     if not trig & {"push", "pull_request"}:
@@ -908,6 +950,12 @@ def make_plan(wf: Workflow, det: Detection, cfg: dict) -> Plan:
             plan.notes.append("No pull_request trigger: PR gate scans will not run")
         if "push" not in trig:
             plan.notes.append("No push trigger: the policy scan on the default branch will not run")
+        if dec["sast"][0] and "sandboxes" in plan.sast_scans:
+            if "pull_request" not in trig:
+                plan.notes.append("Sandbox scans run on pull requests, but the workflow has no pull_request trigger")
+            else:
+                plan.notes.append("Sandboxes are named after the PR source branch and are not deleted when the PR "
+                                  "closes; remove stale ones in the Veracode Platform")
         if "pull_request" in trig and not push_runs_on(wf, cfg["branch"]):
             plan.notes.append(f"Pushes to `{cfg['branch']}` don't trigger this workflow; open a PR from it to test")
     conc = wf.data.get("concurrency")
@@ -921,10 +969,13 @@ def make_plan(wf: Workflow, det: Detection, cfg: dict) -> Plan:
     want_compiled = bool(det.compiled) or cfg["sast"] == "on" or (det.truncated and not det.sast_langs)
     want_source = bool(det.source)
 
-    build, ambiguous = choose_build(wf, cfg)
-    if ambiguous:
-        raise Skip(f"several jobs build the code ({', '.join(ambiguous)}); "
-                   "set build_job in the config or --build-job")
+    build, others = choose_build(wf, cfg)
+    if others and (want_compiled or cfg.get("build_job")):
+        if cfg.get("strict"):
+            raise Skip(f"several jobs build the code ({', '.join([build.job, *others])}); "
+                       "set build_job in the config or --build-job")
+        plan.notes.append(f"Build job `{build.job}` picked over {', '.join(f'`{o}`' for o in others[:4])}; "
+                          "set build_job to change it")
     if build and (want_compiled or cfg.get("build_job")):
         plan.build = build
         plan.needs = build.job
@@ -1033,6 +1084,26 @@ with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
     fh.write(f"units={json.dumps(units)}\n")'''
 
 FORK_GUARD = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false"
+# Event conditions. PRs count only when they target the default branch (except the Pipeline Scan gate).
+ON_BRANCH_PUSH = "(github.event_name == 'push' && github.ref_name != github.event.repository.default_branch)"
+ON_DEFAULT_PUSH = "(github.event_name == 'push' && github.ref_name == github.event.repository.default_branch)"
+ON_PR_TO_DEFAULT = "(github.event_name == 'pull_request' && github.base_ref == github.event.repository.default_branch)"
+ON_ANY_PR = "github.event_name == 'pull_request'"
+SAST_SCANS = ("pipeline", "policy", "sandboxes")
+SAST_SCAN_EVENTS = {
+    "pipeline": [ON_ANY_PR, ON_BRANCH_PUSH],
+    "policy": [ON_DEFAULT_PUSH],
+    "sandboxes": [ON_PR_TO_DEFAULT],
+}
+SCAN_LABELS = {
+    "pipeline": "Pipeline Scan on branch pushes and PRs",
+    "policy": "Policy Scan on pushes to the default branch",
+    "sandboxes": "Sandbox scan (sandbox = PR source branch) on PRs into the default branch",
+}
+
+
+def selected_scans(cfg: dict) -> list[str]:
+    return [s for s in SAST_SCANS if cfg.get(s)]
 
 
 def _q(value: str) -> str:
@@ -1045,6 +1116,29 @@ def _yq(value: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_./@*!-]+", value) and not value.startswith(("*", "!", "-", "@")):
         return value
     return "'" + value.replace("'", "''") + "'"
+
+
+def _if_block(conds: list[str], guard: str | None = None) -> list[str]:
+    """Folded `if:` from OR-ed conditions, optionally AND-ed with a guard."""
+    lines = ["  if: >-"]
+    if guard:
+        lines.append(f"    ({guard}) &&")
+    if len(conds) == 1:
+        lines.append(f"    {conds[0]}")
+    else:
+        lines.append(f"    ({conds[0]} ||")
+        lines += [f"    {c} ||" for c in conds[1:-1]]
+        lines.append(f"    {conds[-1]})")
+    return lines
+
+
+def _download_units(actions: dict) -> list[str]:
+    return ["    - name: Download scan units", f"      uses: {actions['download']}", "      with:",
+            "        name: veracode-scan-units", "        path: veracode-units"]
+
+
+def _creds() -> list[str]:
+    return ["        vid: ${{ secrets.VERACODE_API_ID }}", "        vkey: ${{ secrets.VERACODE_API_KEY }}"]
 
 
 def render_upload_step(plan: Plan, cfg: dict, actions: dict) -> list[str]:
@@ -1064,11 +1158,17 @@ def render_jobs(plan: Plan, cfg: dict, actions: dict) -> list[str]:
     runner = _yq(str(cfg["runner"]))
     out: list[str] = []
     perms = ["  permissions:", "    contents: read"]
-    if plan.sast_mode != "off":
+    scans = selected_scans(cfg)
+    has_units = "needs.veracode-prepare.outputs.units != '[]'"
+    if plan.sast_mode != "off" and scans:
         out += ["veracode-prepare:", "  name: Veracode SAST prepare"]
         if plan.needs:
             out.append(f"  needs: {plan.needs}")
-        out += [f"  if: {FORK_GUARD}", f"  runs-on: {runner}", *perms,
+        events = list(dict.fromkeys(c for s in scans for c in SAST_SCAN_EVENTS[s]))
+        if ON_ANY_PR in events and ON_PR_TO_DEFAULT in events:
+            events.remove(ON_PR_TO_DEFAULT)
+        out += _if_block(events, FORK_GUARD)
+        out += [f"  runs-on: {runner}", *perms,
                 "  outputs:", "    units: ${{ steps.units.outputs.units }}", "  steps:"]
         source = "source" in plan.sast_mode
         if source:
@@ -1090,26 +1190,18 @@ def render_jobs(plan: Plan, cfg: dict, actions: dict) -> list[str]:
                 f"      uses: {actions['upload']}", "      with:", "        name: veracode-scan-units",
                 "        path: veracode-units/", f"        retention-days: {int(cfg['retention_days'])}"]
 
+    if plan.sast_mode != "off" and "pipeline" in scans:
         policy = cfg["pr_gate_policy"] or ""
         sev = cfg["branch_fail_on_severity"] or ""
-        out += [
-            "veracode-pipeline-scan:",
-            "  name: Veracode Pipeline Scan (${{ matrix.unit }})",
-            "  needs: veracode-prepare",
-            "  if: >-",
-            "    needs.veracode-prepare.outputs.units != '[]' &&",
-            "    (github.event_name == 'pull_request' ||",
-            "    (github.event_name == 'push' && github.ref_name != github.event.repository.default_branch))",
-            f"  runs-on: {runner}", *perms,
-            "  strategy:", "    fail-fast: false", "    matrix:",
-            "      unit: ${{ fromJSON(needs.veracode-prepare.outputs.units) }}",
-            "  steps:",
-            "    - name: Download scan units", f"      uses: {actions['download']}", "      with:",
-            "        name: veracode-scan-units", "        path: veracode-units",
-            "    - name: Veracode Pipeline Scan", f"      uses: {actions['pipeline']}", "      with:",
-            "        vid: ${{ secrets.VERACODE_API_ID }}", "        vkey: ${{ secrets.VERACODE_API_KEY }}",
-            "        file: veracode-units/${{ matrix.unit }}",
-        ]
+        out += ["veracode-pipeline-scan:", "  name: Veracode Pipeline Scan (${{ matrix.unit }})",
+                "  needs: veracode-prepare", "  if: >-", f"    {has_units} &&",
+                f"    ({ON_ANY_PR} ||", f"    {ON_BRANCH_PUSH})",
+                f"  runs-on: {runner}", *perms,
+                "  strategy:", "    fail-fast: false", "    matrix:",
+                "      unit: ${{ fromJSON(needs.veracode-prepare.outputs.units) }}",
+                "  steps:", *_download_units(actions),
+                "    - name: Veracode Pipeline Scan", f"      uses: {actions['pipeline']}", "      with:",
+                *_creds(), "        file: veracode-units/${{ matrix.unit }}"]
         if policy:
             out += ["        # PR: gate on the policy. Branch push: any flaw fails.",
                     f"        veracode_policy_name: ${{{{ github.event_name == 'pull_request' && {_q(policy)} || '' }}}}"]
@@ -1117,32 +1209,46 @@ def render_jobs(plan: Plan, cfg: dict, actions: dict) -> list[str]:
             out.append(f"        fail_on_severity: ${{{{ github.event_name != 'pull_request' && {_q(sev)} || '' }}}}")
         out += ["        fail_build: true", "        issue_details: true",
                 "        artifact_name: ${{ matrix.unit }}"]
-        out += [
-            "veracode-policy-scan:",
-            "  name: Veracode Policy Scan",
-            "  needs: veracode-prepare",
-            "  if: >-",
-            "    needs.veracode-prepare.outputs.units != '[]' &&",
-            "    github.event_name == 'push' && github.ref_name == github.event.repository.default_branch",
-            f"  runs-on: {runner}", *perms,
-            "  # Never cancel an in-flight policy upload.",
-            "  concurrency:", "    group: veracode-policy-${{ github.repository }}",
-            "    cancel-in-progress: false",
-            "  steps:",
-            "    - name: Download scan units", f"      uses: {actions['download']}", "      with:",
-            "        name: veracode-scan-units", "        path: veracode-units",
-            "    - name: Veracode Upload and Scan", f"      uses: {actions['policy']}", "      with:",
-            "        vid: ${{ secrets.VERACODE_API_ID }}", "        vkey: ${{ secrets.VERACODE_API_KEY }}",
-            "        appname: ${{ secrets.VERACODE_APP_NAME || github.repository }}",
-            "        createprofile: true",
-            "        filepath: veracode-units",
-            "        version: ${{ github.ref_name }}-${{ github.run_number }}-${{ github.run_attempt }}",
-        ]
+
+    if plan.sast_mode != "off" and "policy" in scans:
+        out += ["veracode-policy-scan:", "  name: Veracode Policy Scan", "  needs: veracode-prepare",
+                "  if: >-", f"    {has_units} &&", f"    {ON_DEFAULT_PUSH}",
+                f"  runs-on: {runner}", *perms,
+                "  # Never cancel an in-flight policy upload.",
+                "  concurrency:", "    group: veracode-policy-${{ github.repository }}",
+                "    cancel-in-progress: false",
+                "  steps:", *_download_units(actions),
+                "    - name: Veracode Upload and Scan", f"      uses: {actions['policy']}", "      with:",
+                *_creds(),
+                "        appname: ${{ secrets.VERACODE_APP_NAME || github.repository }}",
+                "        createprofile: true",
+                "        filepath: veracode-units",
+                "        version: ${{ github.ref_name }}-${{ github.run_number }}-${{ github.run_attempt }}"]
+
+    if plan.sast_mode != "off" and "sandboxes" in scans:
+        out += ["veracode-sandbox-scan:", "  name: Veracode Sandbox Scan", "  needs: veracode-prepare",
+                "  if: >-", f"    {has_units} &&", f"    {ON_PR_TO_DEFAULT}",
+                f"  runs-on: {runner}", *perms,
+                "  # One upload per sandbox at a time; a newer commit replaces an unfinished scan.",
+                "  concurrency:", "    group: veracode-sandbox-${{ github.repository }}-${{ github.head_ref }}",
+                "    cancel-in-progress: false",
+                "  steps:", *_download_units(actions),
+                "    - name: Veracode Upload and Scan (sandbox)", f"      uses: {actions['policy']}", "      with:",
+                *_creds(),
+                "        appname: ${{ secrets.VERACODE_APP_NAME || github.repository }}",
+                "        createprofile: true",
+                "        createsandbox: true",
+                "        sandboxname: ${{ github.head_ref }}",
+                "        deleteincompletescan: true",
+                "        filepath: veracode-units",
+                "        version: ${{ github.head_ref }}-${{ github.run_number }}-${{ github.run_attempt }}"]
+
     if plan.sca:
         sca_runner = _yq(plan.sca_runner) if plan.sca_runner else runner
-        out += ["veracode-sca:", "  name: Veracode SCA", f"  if: {FORK_GUARD}", f"  runs-on: {sca_runner}",
-                *perms, "  steps:", "    - name: Checkout", f"      uses: {actions['checkout']}",
-                "    - name: Veracode agent-based SCA"]
+        out += ["veracode-sca:", "  name: Veracode SCA",
+                *_if_block([ON_PR_TO_DEFAULT, ON_DEFAULT_PUSH], FORK_GUARD),
+                f"  runs-on: {sca_runner}", *perms, "  steps:", "    - name: Checkout",
+                f"      uses: {actions['checkout']}", "    - name: Veracode agent-based SCA"]
         if not cfg["sca_blocking"]:
             out.append("      continue-on-error: true")
         out += [f"      uses: {actions['sca']}", "      env:",
@@ -1157,8 +1263,7 @@ def render_jobs(plan: Plan, cfg: dict, actions: dict) -> list[str]:
                 f"      uses: {actions['checkout']}", "    - name: Veracode IaC and Secrets scan"]
         if not cfg["iac_blocking"]:
             out.append("      continue-on-error: true")
-        out += [f"      uses: {actions['iac']}", "      with:",
-                "        vid: ${{ secrets.VERACODE_API_ID }}", "        vkey: ${{ secrets.VERACODE_API_KEY }}",
+        out += [f"      uses: {actions['iac']}", "      with:", *_creds(),
                 "        command: scan", "        type: directory", "        source: ./",
                 "        format: table", f"        fail_build: {'true' if cfg['iac_blocking'] else 'false'}"]
     return out
@@ -1221,6 +1326,8 @@ def inject(text: str, plan: Plan, cfg: dict, actions: dict, force: bool = False)
 
 def verify_additions(base: str, new: str, plan: Plan) -> None:
     """The client's jobs must be unchanged except for the one added upload step."""
+    if not base.endswith(("\n", "\r")):
+        base += _eol(base)  # the only other change allowed: a final newline
     try:
         before, after = load_yaml(base), load_yaml(new)
     except yaml.YAMLError as exc:  # pragma: no cover - defensive
@@ -1289,6 +1396,9 @@ def _check_keys(values: dict, where: str) -> None:
         raise ToolError(f"unknown config keys in {where}: {', '.join(sorted(unknown))}")
     if "artifact_path" in values and isinstance(values["artifact_path"], str):
         values["artifact_path"] = [values["artifact_path"]]
+    for key in ("pipeline", "policy", "sandboxes", "sca_blocking", "iac_blocking", "strict"):
+        if key in values and not isinstance(values[key], bool):
+            raise ToolError(f"{where}.{key} must be true or false")
     for key, allowed in (("sast", {"auto", "on", "off"}), ("sca", {"auto", "on", "off"}),
                          ("iac", {"on", "artifacts", "off"})):
         if key in values:
@@ -1319,24 +1429,68 @@ class GitHubError(Exception):
 
 
 class GitHub:
+    """Serial REST client: waits out rate limits instead of failing, paces writes."""
+
+    WRITE_INTERVAL = 1.0      # seconds between writes (secondary rate limit guidance)
+    LOW_WATER = 25            # pause when fewer calls than this remain
+    MAX_RATE_WAITS = 12
+
     def __init__(self, token: str, api: str):
         self.token, self.api = token, api.rstrip("/")
         self.last_headers: dict = {}
+        self.calls = 0
+        self._last_write = 0.0
+
+    def _headers(self) -> dict:
+        return {k.lower(): v for k, v in self.last_headers.items()}
+
+    def _sleep(self, seconds: float, why: str) -> None:
+        print(f"   ... {why}; waiting {int(seconds)}s", file=sys.stderr, flush=True)
+        time.sleep(seconds)
+
+    def _reset_in(self) -> float | None:
+        h = self._headers()
+        reset = h.get("x-ratelimit-reset", "")
+        if h.get("x-ratelimit-remaining") == "0" and reset.isdigit():
+            return max(1.0, int(reset) - time.time() + 2)
+        return None
+
+    def _throttle(self) -> None:
+        h = self._headers()
+        rem, reset = h.get("x-ratelimit-remaining", ""), h.get("x-ratelimit-reset", "")
+        if rem.isdigit() and int(rem) < self.LOW_WATER and reset.isdigit():
+            wait = int(reset) - time.time() + 2
+            if wait > 0:
+                self._sleep(min(wait, 3700), f"GitHub API budget nearly used ({rem} left)")
 
     def request(self, method: str, path: str, body: dict | None = None, allow: tuple = ()):
         url = path if path.startswith("http") else f"{self.api}{path}"
         data = json.dumps(body).encode() if body is not None else None
-        for attempt in range(4):
+        if method != "GET":
+            gap = self.WRITE_INTERVAL - (time.monotonic() - self._last_write)
+            if gap > 0:
+                time.sleep(gap)
+        transient = limited = 0
+        while True:
             req = urllib.request.Request(url, data=data, method=method, headers={
                 "Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28", "User-Agent": f"{TOOL}/{VERSION}",
                 **({"Content-Type": "application/json"} if data else {})})
             try:
                 with urllib.request.urlopen(req, timeout=60) as resp:
+                    self.calls += 1
                     self.last_headers = dict(resp.headers)
                     raw = resp.read()
-                    return resp.status, (json.loads(raw) if raw else None)
+                    status = resp.status
+                if method != "GET":
+                    self._last_write = time.monotonic()
+                self._throttle()
+                try:
+                    return status, (json.loads(raw) if raw else None)
+                except ValueError:
+                    raise GitHubError(status, "response is not JSON (proxy or wrong GITHUB_API_URL?)") from None
             except urllib.error.HTTPError as exc:
+                self.calls += 1
                 raw = exc.read()
                 self.last_headers = dict(exc.headers or {})
                 try:
@@ -1344,20 +1498,30 @@ class GitHub:
                 except ValueError:
                     payload = {"message": raw[:200].decode(errors="replace")}
                 msg = payload.get("message", "") if isinstance(payload, dict) else ""
-                limited = exc.code == 429 or (exc.code == 403 and "rate limit" in msg.lower())
-                if (limited or exc.code >= 500) and attempt < 3:
-                    wait = self.last_headers.get("Retry-After")
-                    time.sleep(min(int(wait) if wait and wait.isdigit() else 2 ** (attempt + 1), 60))
+                h = self._headers()
+                rate = exc.code == 429 or (exc.code == 403 and (
+                    "rate limit" in msg.lower() or h.get("x-ratelimit-remaining") == "0"))
+                if rate and limited < self.MAX_RATE_WAITS:
+                    limited += 1
+                    wait = self._reset_in()
+                    if wait is None:
+                        ra = h.get("retry-after", "")
+                        wait = int(ra) if ra.isdigit() else min(60 * 2 ** (limited - 1), 900)
+                    self._sleep(min(wait, 3700), f"GitHub rate limit ({exc.code})")
+                    continue
+                if exc.code >= 500 and transient < 3:
+                    transient += 1
+                    time.sleep(2 ** transient)
                     continue
                 if exc.code in allow:
                     return exc.code, payload
                 raise GitHubError(exc.code, msg or "request failed") from None
-            except urllib.error.URLError as exc:
-                if attempt < 3:
-                    time.sleep(2 ** (attempt + 1))
+            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
+                if transient < 3:
+                    transient += 1
+                    time.sleep(2 ** transient)
                     continue
-                raise GitHubError(0, str(exc.reason)) from None
-        raise GitHubError(0, "retries exhausted")  # pragma: no cover
+                raise GitHubError(0, str(getattr(exc, "reason", exc))) from None
 
     def get(self, path: str, allow404: bool = False):
         status, data = self.request("GET", path, allow=(404,) if allow404 else ())
@@ -1369,6 +1533,8 @@ class GitHub:
         while True:
             data = self.get(f"{path}{sep}per_page=100&page={page}")
             items = data.get(key, []) if key and isinstance(data, dict) else (data or [])
+            if not isinstance(items, list):
+                raise GitHubError(0, f"unexpected response shape for {path}")
             out += items
             if len(items) < 100:
                 return out
@@ -1393,8 +1559,10 @@ def q(s: str) -> str:
 
 
 def list_targets(gh: GitHub, targets: list[str], excludes: list[str], include_forks: bool,
-                 login: str) -> list[dict]:
+                 login: str) -> tuple[list[dict], list[str]]:
+    """Resolve targets to repos. Returns (repos, explicit repos that were not found)."""
     repos: dict[str, dict] = {}
+    missing: list[str] = []
     for target in targets:
         target = target.strip().strip("/")
         if not target:
@@ -1406,7 +1574,8 @@ def list_targets(gh: GitHub, targets: list[str], excludes: list[str], include_fo
         if not any(c in pattern for c in "*?["):
             repo = gh.get(f"/repos/{q(owner)}/{q(pattern)}", allow404=True)
             if repo is None:
-                raise ToolError(f"--target {target}: repository not found or no access")
+                missing.append(target)
+                continue
             candidates = [repo]
         else:
             if owner.lower() == login.lower():
@@ -1425,7 +1594,7 @@ def list_targets(gh: GitHub, targets: list[str], excludes: list[str], include_fo
             if any(fnmatch.fnmatch(full.lower(), e.lower()) for e in excludes):
                 continue
             repos[full.lower()] = r
-    return sorted(repos.values(), key=lambda r: r["full_name"].lower())
+    return sorted(repos.values(), key=lambda r: r["full_name"].lower()), missing
 
 
 def read_file(gh: GitHub, full: str, path: str, ref: str) -> tuple[str, str] | None:
@@ -1529,14 +1698,16 @@ def commit_message(plan: Plan, removing: bool = False) -> str:
     sast = {"off": "off", "binary": "build output", "source": "source code",
             "binary+source": "build output and source code"}[plan.sast_mode]
     r = plan.reasons
-    lines.append(f"- SAST: {sast}" + (f", runs after job `{plan.needs}`" if plan.needs and plan.sast_mode != "off" else "")
-                 + ("; Pipeline Scan on branch pushes and PRs, Policy Scan on the default branch" if plan.sast_mode != "off" else ""))
+    lines.append(f"- SAST: {sast}" + (f", runs after job `{plan.needs}`" if plan.needs and plan.sast_mode != "off" else ""))
+    if plan.sast_mode != "off":
+        lines += [f"  - {SCAN_LABELS[s]}" for s in plan.sast_scans]
     if r.get("sast"):
         lines.append(f"  Why: {r['sast']}")
-    lines.append(f"- SCA: {s['sca']} (agent-based)" + (f"\n  Why: {r['sca']}" if r.get("sca") else ""))
+    lines.append(f"- SCA: {s['sca']} (agent-based, on PRs into the default branch and pushes to it)"
+                 + (f"\n  Why: {r['sca']}" if r.get("sca") else ""))
     if plan.sca_runner:
         lines.append(f"  Runner: {plan.sca_runner} ({r.get('runner', '')})")
-    lines.append(f"- IaC/Secrets: {s['iac']}" + (f"\n  Why: {r['iac']}" if r.get("iac") else ""))
+    lines.append(f"- IaC/Secrets: {s['iac']} (every run)" + (f"\n  Why: {r['iac']}" if r.get("iac") else ""))
     if plan.todos:
         lines += ["", "TODO"] + [f"- {t}" for t in plan.todos]
     if plan.notes:
@@ -1593,42 +1764,83 @@ def choose_workflow(files: dict[str, str], det: Detection, cfg: dict, removing: 
     cands = [w for w in parsed if w.triggers() & {"push", "pull_request"}]
     if not cands:
         raise Skip("no workflow triggered by push or pull_request")
+    # Reusable workflows only get the secrets their callers pass; scans belong in the callers.
+    reusable = [w for w in cands if "workflow_call" in w.triggers()]
+    cands = [w for w in cands if "workflow_call" not in w.triggers()]
+    if not cands:
+        raise Skip(f"only reusable workflows ({', '.join(w.path for w in reusable)}) run on push/pull_request; "
+                   "add the scans to their callers with `workflow`")
 
-    def rank(w: Workflow):
+    def rank(w: Workflow) -> tuple:
         stem = w.path.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
-        has_build = bool([m for m in find_builds(w)])
-        return (1 if DEPRIORITIZED_WF.search(stem) else 0,
+        has_build = bool(find_builds(w))
+        name_pref = 0 if stem in PREFERRED_WF else 1 if re.search(
+            r"(^|[-_])(ci|build|test|tests|check|main|pr|pull)([-_]|$)", stem) else 2
+        os_pref = 2 if NON_LINUX_RE.search(stem) else min((_os_rank(j) for j in w.jobs.values()), default=1)
+        return (1 if NOT_CI_WF.search(stem) else 0,
                 0 if (has_build or not det.compiled) else 1,
                 0 if anchor_jobs(w) else 1,
                 0 if {"push", "pull_request"} <= w.triggers() else 1,
-                0 if stem in PREFERRED_WF else 1)
-    cands.sort(key=rank)
+                name_pref, os_pref)
+
+    cands.sort(key=lambda w: (rank(w), -len(anchor_jobs(w)), w.path.lower()))
     top = [w for w in cands if rank(w) == rank(cands[0])]
     if len(top) > 1:
-        raise Skip(f"several candidate workflows ({', '.join(w.path for w in top)}); "
-                   "set `workflow` in the config or --workflow")
+        if cfg.get("strict"):
+            raise Skip(f"several candidate workflows ({', '.join(w.path for w in top)}); "
+                       "set `workflow` in the config or --workflow")
+        others = [w.path.rsplit("/", 1)[-1] for w in top[1:5]]
+        notes.append(f"Workflow {cands[0].path.rsplit('/', 1)[-1]} picked over {', '.join(others)}; "
+                     "set `workflow` to change it")
     return cands[0], notes
+
+
+COMMIT_PREFIXES = ("Add Veracode scans to ", "Remove Veracode scans from ")
+TERMINAL = ("committed", "removed", "up_to_date", "would_change", "detected")
+_BAD_REF = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]|\.\.|@\{|//|^/|/$|^\.|\.$|\.lock$|^@$")
+
+
+def valid_branch(name: str) -> bool:
+    return bool(name) and not _BAD_REF.search(name) and not any(
+        part.startswith(".") or part.endswith(".lock") for part in name.split("/"))
+
+
+def foreign_commits(gh: GitHub, full: str, default: str, branch: str) -> int:
+    """Commits on `branch` (ahead of default) that this tool did not make."""
+    data = gh.get(f"/repos/{full}/compare/{q(default)}...{q(branch)}", allow404=True) or {}
+    commits = data.get("commits") or []
+    return sum(1 for c in commits
+               if not str(c.get("commit", {}).get("message", "")).startswith(COMMIT_PREFIXES))
 
 
 def process_repo(gh: GitHub, repo: dict, cfg: dict, actions: dict, args) -> Result:
     full = repo["full_name"]
     res = Result(full, "skipped")
+    if repo.get("archived") or repo.get("disabled"):
+        res.detail = "archived or disabled repository"
+        return res
     default = repo.get("default_branch") or "main"
     branch = cfg["branch"]
+    if not valid_branch(str(branch)):
+        res.detail = f"invalid branch name {branch!r}"
+        return res
     if branch == default:
-        raise ToolError("--branch must differ from the default branch")
+        res.detail = f"branch {branch!r} is the default branch; choose another branch"
+        return res
     on_branch = None if args.detect_only else branch_sha(gh, full, branch)
     ref = branch if on_branch else default  # workflow source: keeps edits made on the branch
 
     # Detection always reads the default branch: it holds the current code.
     status, tree = gh.request("GET", f"/repos/{full}/git/trees/{q(default)}?recursive=1", allow=(404, 409))
-    if status in (404, 409):
+    if status in (404, 409) or not isinstance(tree, dict):
         res.detail = "empty repository"
         return res
-    blobs = [t for t in tree.get("tree", []) if t.get("type") == "blob"]
-    paths = [t["path"] for t in blobs]
-    sizes = {t["path"]: t.get("size") for t in blobs}
+    blobs = [t for t in tree.get("tree") or [] if isinstance(t, dict) and t.get("type") == "blob"]
+    paths = [t["path"] for t in blobs if isinstance(t.get("path"), str)]
+    sizes = {t["path"]: t.get("size") for t in blobs if isinstance(t.get("path"), str)}
     linguist = gh.get(f"/repos/{full}/languages", allow404=True) or {}
+    if not isinstance(linguist, dict):
+        linguist = {}
 
     def read_project(path: str) -> str | None:
         got = read_file(gh, full, path, default)
@@ -1641,6 +1853,16 @@ def process_repo(gh: GitHub, repo: dict, cfg: dict, actions: dict, args) -> Resu
     if args.detect_only:
         res.outcome = "detected"
         return res
+    if not args.remove and not (dec["sast"][0] or dec["sca"][0] or dec["iac"][0]):
+        res.detail = "no scan applies to this repository"
+        return res
+
+    if on_branch and not args.force:
+        foreign = foreign_commits(gh, full, default, branch)
+        if foreign:
+            res.detail = (f"branch {branch} has {foreign} commit(s) not made by this tool; "
+                          "use another --branch, or --force to add to it")
+            return res
 
     listing = gh.get(f"/repos/{full}/contents/.github/workflows?ref={q(ref)}", allow404=True)
     if not isinstance(listing, list):
@@ -1648,28 +1870,37 @@ def process_repo(gh: GitHub, repo: dict, cfg: dict, actions: dict, args) -> Resu
         return res
     files, shas = {}, {}
     for item in listing:
-        if item.get("type") == "file" and item["name"].lower().endswith((".yml", ".yaml")):
+        if isinstance(item, dict) and item.get("type") == "file" and \
+                str(item.get("name", "")).lower().endswith((".yml", ".yaml")):
             got = read_file(gh, full, item["path"], ref)
             if got:
                 files[item["path"]], shas[item["path"]] = got
     if not files:
         res.detail = "no workflow files"
         return res
-    if not args.remove and not (dec["sast"][0] or dec["sca"][0] or dec["iac"][0]):
-        res.detail = "no scan applies to this repository"
-        return res
 
     try:
         wf, notes = choose_workflow(files, det, cfg, args.remove, args.force)
         res.workflow = wf.path
-        old = wf.text
+        old = base = wf.text
+        if on_branch and not args.remove:
+            # The branch copy must match the default branch outside the managed blocks.
+            on_default = read_file(gh, full, wf.path, default)
+            if on_default is None:
+                raise Skip(f"{wf.path} is not on {default}; delete the branch {branch} and re-run")
+            if strip_managed(old)[0] != strip_managed(on_default[0])[0]:
+                if not args.force:
+                    raise Skip(f"{wf.path} on {branch} differs from {default} outside the managed blocks "
+                               f"(edited on the branch, or changed on {default}); merge {default} into "
+                               f"{branch}, delete the branch, or use --force to rebuild it from {default}")
+                base = on_default[0]
         if args.remove:
             plan = Plan(wf.path)
             new = remove(old, args.force)
         else:
-            plan = make_plan(wf, det, cfg)
+            plan = make_plan(parse_workflow(wf.path, base), det, cfg)
             plan.notes = notes + plan.notes
-            new = inject(old, plan, cfg, actions, args.force)
+            new = inject(base, plan, cfg, actions, args.force)
     except (Skip, ToolError) as exc:
         res.detail = str(exc)
         return res
@@ -1702,15 +1933,73 @@ def process_repo(gh: GitHub, repo: dict, cfg: dict, actions: dict, args) -> Resu
 
     if not on_branch:
         base_sha = branch_sha(gh, full, default)
-        gh.request("POST", f"/repos/{full}/git/refs", {"ref": f"refs/heads/{branch}", "sha": base_sha})
+        if not base_sha:
+            res.outcome, res.detail = "failed", f"cannot read the head of {default}"
+            return res
+        status, _ = gh.request("POST", f"/repos/{full}/git/refs",
+                               {"ref": f"refs/heads/{branch}", "sha": base_sha}, allow=(422,))
+        if status == 422:
+            res.outcome, res.detail = "failed", f"branch {branch} appeared during the run; re-run this repo"
+            return res
     body = {"message": commit_message(plan, args.remove), "branch": branch,
-            "content": base64.b64encode(new.encode("utf-8")).decode()}
-    body["sha"] = shas[wf.path]
-    _, data = gh.request("PUT", f"/repos/{full}/contents/{urllib.parse.quote(wf.path)}", body)
+            "content": base64.b64encode(new.encode("utf-8")).decode(), "sha": shas[wf.path]}
+    status, data = gh.request("PUT", f"/repos/{full}/contents/{urllib.parse.quote(wf.path)}", body,
+                              allow=(409,))
+    if status == 409:
+        res.outcome, res.detail = "failed", f"{wf.path} changed on {branch} during the run; re-run this repo"
+        return res
     res.outcome = "removed" if args.remove else "committed"
     res.url = f"{repo.get('html_url', '')}/tree/{branch}"
-    res.detail = (data or {}).get("commit", {}).get("sha", "")[:12]
+    res.detail = ((data or {}).get("commit") or {}).get("sha", "")[:12]
     return res
+
+
+REPORT_FIELDS = ["repo", "outcome", "workflow", "sast", "sca", "iac", "detail", "todos", "branch_url",
+                 "sast_reason", "sca_reason", "iac_reason", "runner_reason", "notes"]
+
+
+class Report:
+    """CSV written row by row, so an interrupted run keeps its results."""
+
+    def __init__(self, path: str | None, resume: bool):
+        self.path, self.done, self.fh, self.writer = path, set(), None, None
+        if not path:
+            return
+        exists = os.path.exists(path) and os.path.getsize(path) > 0
+        if resume and exists:
+            with open(path, newline="", encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+            if rows and set(REPORT_FIELDS) - set(rows[0]):
+                raise ToolError(f"{path} is not a report from this tool")
+            self.done = {r["repo"].lower() for r in rows if r.get("outcome") in TERMINAL}
+        self.fh = open(path, "a" if (resume and exists) else "w", newline="", encoding="utf-8")
+        self.writer = csv.writer(self.fh)
+        if not (resume and exists):
+            self.writer.writerow(REPORT_FIELDS)
+            self.fh.flush()
+
+    def add(self, r: Result) -> None:
+        if not self.writer:
+            return
+        why, d = r.reasons, r.decided
+
+        def state(key: str, planned: str) -> str:
+            return planned or (("on" if d.get(key) else "off") if d else "")
+
+        def cell(v) -> str:
+            v = str(v)
+            return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
+        self.writer.writerow([cell(x) for x in (
+            r.repo, r.outcome, r.workflow, state("sast", r.sast), state("sca", r.sca), state("iac", r.iac),
+            r.detail, " | ".join(r.todos), r.url, why.get("sast", ""), why.get("sca", ""),
+            why.get("iac", ""), why.get("runner", ""),
+            " | ".join(c.detail for c in r.checks if c.name == "note"))])
+        self.fh.flush()
+
+    def close(self) -> None:
+        if self.fh:
+            self.fh.close()
+            print(f"Report: {self.path}")
 
 
 def run_targets(args, cli_cfg: dict) -> int:
@@ -1721,30 +2010,61 @@ def run_targets(args, cli_cfg: dict) -> int:
     except GitHubError as exc:
         raise ToolError(f"GitHub authentication failed ({exc})") from None
     scopes = gh.last_headers.get("X-OAuth-Scopes") or gh.last_headers.get("x-oauth-scopes")
-    if scopes is not None and not args.dry_run:
+    if scopes is not None and not (args.dry_run or args.detect_only):
         have = {s.strip() for s in scopes.split(",")}
         if not {"repo", "workflow"} <= have and not ({"public_repo", "workflow"} <= have):
             raise ToolError(f"token scopes '{scopes}' cannot write workflow files; "
                             "needs repo + workflow (gh auth refresh -s workflow)")
     actions = pin_actions(gh) if args.pin_sha else dict(ACTIONS)
-    repos = list_targets(gh, args.target, args.exclude, args.include_forks, user["login"])
-    if not repos:
+    repos, missing = list_targets(gh, args.target, args.exclude, args.include_forks, user["login"])
+    report = Report(args.report, args.resume)
+    results = [Result(m, "failed", detail="repository not found or no access") for m in missing]
+    for r in results:
+        report.add(r)
+        print_result(r, args.dry_run, args.quiet)
+    todo = [r for r in repos if r["full_name"].lower() not in report.done]
+    if report.done:
+        print(f"Resuming: {len(repos) - len(todo)} repositories already done in {args.report}")
+    if not repos and not missing:
         print("No repositories matched the targets.")
+        report.close()
         return 1
-    results = []
-    for repo in repos:
-        cfg = effective_config(base_cfg, overrides, cli_cfg, repo["full_name"])
-        try:
-            res = process_repo(gh, repo, cfg, actions, args)
-        except GitHubError as exc:
-            res = Result(repo["full_name"], "failed", detail=str(exc))
-        results.append(res)
-        print_result(res, args.dry_run)
+    changed, stopped = 0, None
+    try:
+        for i, repo in enumerate(todo, 1):
+            cfg = effective_config(base_cfg, overrides, cli_cfg, repo["full_name"])
+            try:
+                res = process_repo(gh, repo, cfg, actions, args)
+            except GitHubError as exc:
+                if exc.status == 401:
+                    stopped = "GitHub rejected the token (expired or revoked); re-run with --resume"
+                    break
+                res = Result(repo["full_name"], "failed", detail=str(exc))
+            except Exception as exc:  # one broken repo must not stop an org-wide run
+                res = Result(repo["full_name"], "failed", detail=f"internal error: {type(exc).__name__}: {exc}")
+                if args.debug:
+                    import traceback
+                    traceback.print_exc()
+            results.append(res)
+            report.add(res)
+            print_result(res, args.dry_run, args.quiet, f"[{i}/{len(todo)}] ")
+            if res.outcome in ("committed", "removed"):
+                changed += 1
+                if args.limit and changed >= args.limit:
+                    stopped = f"--limit {args.limit} reached; re-run with --resume to continue"
+                    break
+    except KeyboardInterrupt:
+        stopped = "interrupted; re-run with --resume to continue"
+    report.close()
     print_summary(results)
-    if args.report:
-        write_report(args.report, results)
-    return 0 if all(r.outcome in ("committed", "removed", "up_to_date", "would_change", "detected")
-                    for r in results) else 1
+    print(f"API calls: {gh.calls}")
+    if stopped:
+        print(f"Stopped: {stopped}", file=sys.stderr)
+        if "token" in stopped:
+            return 3
+        if "interrupted" in stopped:
+            return 130
+    return 0 if all(r.outcome in TERMINAL for r in results) else 1
 
 
 def run_file(args, cli_cfg: dict) -> int:
@@ -1825,8 +2145,11 @@ def print_decisions(dec: dict, indent: str = "   ") -> None:
         print(f"{indent}SCA runner: {runner} ({why})")
 
 
-def print_result(res: Result, dry: bool) -> None:
-    print(f"\n== {res.repo}: {res.outcome}" + (f" ({res.detail})" if res.detail else ""))
+def print_result(res: Result, dry: bool, quiet: bool = False, prefix: str = "") -> None:
+    if quiet:
+        print(f"{prefix}{res.repo}: {res.outcome}" + (f" ({res.detail})" if res.detail else ""), flush=True)
+        return
+    print(f"\n== {prefix}{res.repo}: {res.outcome}" + (f" ({res.detail})" if res.detail else ""))
     if res.reasons:
         print_decisions({k: (res.decided[k], res.reasons[k]) for k in res.reasons})
     if res.workflow:
@@ -1844,24 +2167,6 @@ def print_summary(results: list[Result]) -> None:
     for r in results:
         counts[r.outcome] = counts.get(r.outcome, 0) + 1
     print("\nSummary: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
-
-
-def write_report(path: str, results: list[Result]) -> None:
-    def cell(v: str) -> str:
-        v = str(v)
-        return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        w.writerow(["repo", "outcome", "workflow", "sast", "sca", "iac", "detail", "todos", "branch_url",
-                    "sast_reason", "sca_reason", "iac_reason", "runner_reason"])
-        for r in results:
-            why, d = r.reasons, r.decided
-            plan_or = (lambda k, v: v or ("on" if d.get(k) else "off" if d else ""))
-            w.writerow([cell(x) for x in (r.repo, r.outcome, r.workflow, plan_or("sast", r.sast),
-                                          plan_or("sca", r.sca), plan_or("iac", r.iac), r.detail,
-                                          " | ".join(r.todos), r.url, why.get("sast", ""), why.get("sca", ""),
-                                          why.get("iac", ""), why.get("runner", ""))])
-    print(f"Report: {path}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1889,6 +2194,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--branch-fail-on-severity", help="severities that fail branch-push scans, e.g. 'Very High, High' (default: any flaw)")
     p.add_argument("--runner", help="runs-on for the Veracode jobs (default ubuntu-latest)")
     p.add_argument("--sast", choices=["auto", "on", "off"])
+    p.add_argument("--pipeline", action="store_true", default=None,
+                   help="Pipeline Scan on branch pushes and PRs (default with --policy when no scan flag is given)")
+    p.add_argument("--policy", action="store_true", default=None,
+                   help="Policy Scan (Upload and Scan) on pushes to the default branch")
+    p.add_argument("--sandboxes", action="store_true", default=None,
+                   help="Sandbox scan on PRs into the default branch (sandbox = PR source branch)")
     p.add_argument("--sca", choices=["auto", "on", "off"])
     p.add_argument("--iac", choices=["on", "artifacts", "off"],
                    help="on: every repo (secret scanning); artifacts: only repos with IaC/container files")
@@ -1902,8 +2213,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="run the pre-checks and show the diff, write nothing")
     p.add_argument("--no-diff", action="store_true", help="with --dry-run, do not print diffs")
     p.add_argument("--remove", action="store_true", help="remove the managed Veracode blocks")
+    p.add_argument("--strict", action="store_true", default=None,
+                   help="skip repos where several workflows or build jobs rank equally (default: pick one and note it)")
     p.add_argument("--force", action="store_true", help="overwrite hand-edited managed blocks / add next to existing Veracode steps")
-    p.add_argument("--report", metavar="CSV", help="write a CSV report (targets only)")
+    p.add_argument("--report", metavar="CSV", help="CSV report, written row by row (targets only)")
+    p.add_argument("--resume", action="store_true", help="with --report: skip repos already done in that report and append")
+    p.add_argument("--limit", type=int, metavar="N", help="stop after changing N repositories (canary rollouts)")
+    p.add_argument("--quiet", action="store_true", help="one line per repository")
+    p.add_argument("--debug", action="store_true", help="print tracebacks for internal errors")
     p.add_argument("--source-dir", help="repo root for language detection (--file only; default: the file's repo)")
     p.add_argument("--out", help="write here instead of in place (--file only)")
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -1917,13 +2234,26 @@ def main(argv: list[str] | None = None) -> int:
     if args.build_step and not args.build_job:
         print("error: --build-step needs --build-job", file=sys.stderr)
         return 2
+    if args.resume and not args.report:
+        print("error: --resume needs --report", file=sys.stderr)
+        return 2
+    if args.limit is not None and args.limit < 1:
+        print("error: --limit must be at least 1", file=sys.stderr)
+        return 2
+    if args.branch is not None and not valid_branch(args.branch):
+        print(f"error: invalid branch name {args.branch!r}", file=sys.stderr)
+        return 2
     cli_cfg = {
         "workflow": args.workflow, "build_job": args.build_job, "build_step": args.build_step,
         "artifact_path": args.artifact_path, "branch": args.branch, "pr_gate_policy": args.pr_gate_policy,
         "branch_fail_on_severity": args.branch_fail_on_severity, "runner": args.runner,
         "sast": args.sast, "sca": args.sca, "iac": args.iac, "windows_runner": args.windows_runner,
+        "strict": args.strict,
         "sca_blocking": args.sca_blocking, "iac_blocking": args.iac_blocking,
     }
+    # Any scan flag selects exactly the given scans.
+    if args.pipeline or args.policy or args.sandboxes:
+        cli_cfg.update({s: bool(getattr(args, s)) for s in SAST_SCANS})
     try:
         return run_targets(args, cli_cfg) if args.target else run_file(args, cli_cfg)
     except Skip as exc:
