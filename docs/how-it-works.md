@@ -30,7 +30,7 @@ Detection runs first, on the default branch, before any workflow is read. `--det
 | Scan | On when | Off (reason shown) when |
 |---|---|---|
 | SAST | Java, Kotlin, Scala, Groovy, C#, F#, VB.NET, C/C++ (with Makefile/CMake/Meson/Ninja/vcxproj), JavaScript/TypeScript, Python, Go, PHP, Ruby, Apex, ColdFusion | Only unsupported languages: Dart, Perl, PL/SQL, T-SQL, Classic ASP, RPG, VB6 (no Pipeline Scan support); Swift, Objective-C (need a macOS/Xcode build); COBOL; or C/C++ without a build system |
-| SCA | A resolvable manifest for Java (Maven, Gradle, sbt, Ant/Ivy), JavaScript (npm, Yarn, pnpm, Bower), Python (pip, Pipenv, Poetry, `pyproject.toml`), Go, PHP (Composer), .NET (project files, `packages.config`) | Only supporting files (`global.json`, `Directory.Build.props`, `setup.cfg`, `.sln`, `gradlew`, ...), or ecosystems this setup doesn't scan (`Gemfile`, `Podfile`, `Cargo.toml`, `pubspec.yaml`, ...). Build-tool wrapper jars don't count. |
+| SCA | Anything the [SCA agent supports](https://docs.veracode.com/r/Agent_Based_Scans): Java/Kotlin (Maven, Gradle, Ant/Ivy, jars), Scala (sbt), JavaScript/TypeScript (npm, Yarn, pnpm, Bower), Python (pip, Pipenv, Poetry, `pyproject.toml`), Go (modules, dep, Glide, GoDep, GoVendor, Trash), PHP (Composer), Ruby (Bundler: `Gemfile`), Swift/Objective-C (CocoaPods: `Podfile.lock`), .NET (project files, `packages.config`), C/C++ (Make: a makefile with gcc/g++/clang/CMake and a `clean` target, read to confirm) | Only supporting files (`global.json`, `Directory.Build.props`, `setup.cfg`, `.sln`, `gradlew`, `Podfile` without its lock file, ...), ecosystems the agent doesn't support (`Cargo.toml`, `pubspec.yaml`, `mix.exs`, `Package.swift`, Conan, vcpkg), or a makefile that drives Xcode or lacks the compiler string or `clean` target. A C/C++ Make build in a Windows-only repo stays off (the agent builds with Make on Linux). Build-tool wrapper jars don't count. |
 | IaC/Secrets | Always (`--iac on`), because secrets can be anywhere | `--iac artifacts`: only when Terraform, Dockerfiles, Helm/Kubernetes, CloudFormation/SAM, Bicep, Pulumi or Ansible files exist (YAML/JSON counts under `infra/`, `k8s/`, `deploy/`, ...). `--iac off`: never. |
 | SCA runner | `windows_runner` when the repo has Windows-only .NET/C++ signals (`packages.config`, WebForms files, `.vcxproj`, `.sqlproj`, ...), or when a project file declares `net4x`, `*-windows`, WPF or WinForms | Weak signals (`App.xaml`, `web.config`, `.vbproj`) trigger a read of up to 5 project files (`--deep-dotnet` reads them always). SDK-style `net8.0` stays on Linux, MAUI's OS-conditioned TFMs don't count, and Windows-like files in a repo without .NET/C++ code don't count. |
 
@@ -42,6 +42,7 @@ Detection runs first, on the default branch, before any workflow is read. `--det
 
 - Windows only changes the SCA job's runner. SAST packaging runs on Linux, after the client's own build.
 - There's no per-repo `veracode.yml`. The decision is applied directly in the workflow.
+- SCA also turns on for Ruby (Bundler), Swift/Objective-C (CocoaPods with `Podfile.lock`) and C/C++ (Make), which the agent supports.
 
 ## Scans and events
 
@@ -49,15 +50,13 @@ Detection runs first, on the default branch, before any workflow is read. `--det
 |---|---|---|
 | Pipeline Scan | `--pipeline` / `pipeline` (default on) | Pushes to non-default branches, and pull requests. PRs gate on `pr_gate_policy`; branch pushes fail on any flaw or on `branch_fail_on_severity`. |
 | Policy Scan (Upload and Scan) | `--policy` / `policy` (default on) | Pushes to the default branch, which includes merges |
-| Sandbox scan (Upload and Scan) | `--sandboxes` / `sandboxes` (default off) | Pull requests whose base is the default branch. Sandbox = `github.head_ref` (the PR source branch), with `createsandbox: true` and `deleteincompletescan: true`. |
 | SCA (agent) | `sca` | Pull requests into the default branch, and pushes to it |
 | IaC/Secrets | `iac` | Every run |
 
-- Passing any of `--pipeline`, `--policy`, `--sandboxes` on the command line selects exactly those; the rest are off. With none of them, the config (or the defaults) applies.
+- Passing `--pipeline` or `--policy` on the command line selects exactly those; the other is off. With none of them, the config (or the defaults) applies.
 - `veracode-prepare` only runs on events where at least one selected SAST scan runs.
 - Fork PRs are skipped by every job, because they don't receive secrets.
-- Sandbox and policy uploads submit the scan and return; results appear in the Veracode Platform.
-- Sandboxes aren't deleted when a PR closes. Clean them up in the Platform, because each application profile has a sandbox limit.
+- The policy upload submits the scan and returns; results appear in the Veracode Platform.
 
 ## 2. Choosing the workflow
 
@@ -164,7 +163,9 @@ All come from read-only `--dry-run` / `--detect-only` runs against public reposi
 | `juice-shop/juice-shop` | `ci.yml` | SAST source after job `frontend-test`, SCA, IaC | TypeScript. A test job is preferred over `lint`. |
 | `spring-projects/spring-petclinic` | `gradle-build.yml` | SAST binary after job `build` (Gradle), SCA, IaC | `gradle-build.yml` and `maven-build.yml` tie; the first by name wins with a note. `--workflow maven-build.yml` picks the Maven one. |
 | `ShareX/ShareX` | detection only | SAST, SCA on `windows-latest`, IaC | `App.xaml` triggered a project-file read, and `ShareX.HelpersLib.csproj` targets Windows |
-| `flutter-team-archive/gallery` | detection only | SAST for the Ruby (fastlane) scripts, no SCA, IaC | Dart has no Pipeline Scan support. The `android/` and `ios/` scaffolding is ignored, and `pubspec.yaml` isn't an SCA manifest here. |
+| `jekyll/jekyll` | detection only | SAST, SCA (Bundler), IaC | Ruby with a `Gemfile` |
+| `git/git` | detection only | SAST, SCA (C/C++ Make), IaC | The root `Makefile` has a compiler string and a `clean` target |
+| `exelban/stats` | detection only | SAST for the C/C++/Python parts, no SCA, IaC | Swift/Objective-C need an Xcode build, and the `Makefile` drives `xcodebuild` |
 | `terraform-aws-modules/terraform-aws-vpc` | detection only | IaC only | Only HCL, so no SAST and no SCA |
 
 ## When a setting can't apply
@@ -190,7 +191,6 @@ All come from read-only `--dry-run` / `--detect-only` runs against public reposi
 | Keep SCA on Linux for every repo | `--windows-runner off` |
 | Fix one repo the auto-detection skipped | `repos:` entry with `workflow` / `build_job` / `artifact_path` |
 | Gate branch pushes on severity, not on every flaw | `--branch-fail-on-severity "Very High, High"` |
-| Keep PR scan results on the Veracode Platform | `--sandboxes` (add `--pipeline` too for a fast PR gate) |
 | Only the compliance record, no PR scans | `--policy` |
 | Make SCA or IaC block merges | `--sca-blocking` / `--iac-blocking` |
 | Self-hosted runners | `--runner` (the label needs bash, python3 and git) |

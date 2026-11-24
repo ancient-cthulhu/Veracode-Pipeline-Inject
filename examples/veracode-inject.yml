@@ -8,7 +8,6 @@ defaults:
   sast: auto                           # auto | on | off
   pipeline: true                       # Pipeline Scan: branch pushes + PRs
   policy: true                         # Policy Scan: pushes to the default branch
-  sandboxes: false                     # Sandbox scan: PRs into the default branch
   sca: auto                            # auto | on | off
   iac: "on"                            # on | artifacts | off (quote it: YAML reads bare on as true)
   windows_runner: windows-latest       # SCA runner for Windows-only .NET/C++ builds; "off" disables
@@ -30,8 +29,7 @@ repos:
     build_job: build
     build_step: Publish
   "my-org/regulated-*":
-    pipeline: false
-    sandboxes: true                    # sandbox per PR source branch + policy scan on merge
+    pipeline: false                    # policy scan on merge only, no PR gate
   "my-org/docs-*":
     sast: "off"
     sca: "off"
