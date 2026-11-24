@@ -1,0 +1,30 @@
+# Example config for veracode_inject.py (--config veracode-inject.yml).
+# Command-line flags override these values.
+defaults:
+  branch: veracode/integration
+  pr_gate_policy: Veracode Recommended Very High
+  branch_fail_on_severity: ""          # empty = any flaw fails branch pushes
+  runner: ubuntu-latest
+  sast: auto                           # auto | on | off
+  sca: auto                            # auto | on | off
+  iac: "on"                            # on | artifacts | off (quote it: YAML reads bare on as true)
+  windows_runner: windows-latest       # SCA runner for Windows-only .NET/C++ builds; "off" disables
+  sca_blocking: false
+  iac_blocking: false
+  retention_days: 3
+
+# Per-repo overrides: glob on org/repo, later matches win.
+repos:
+  "my-org/payments-*":
+    workflow: build.yml
+    build_job: package
+    artifact_path:
+      - "services/*/target/*.jar"
+      - "!**/*-tests.jar"
+  "my-org/legacy-desktop":
+    runner: windows-latest             # Veracode jobs need bash, python3 and git
+    build_job: build
+    build_step: Publish
+  "my-org/docs-*":
+    sast: "off"
+    sca: "off"
