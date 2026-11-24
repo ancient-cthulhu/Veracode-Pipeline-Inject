@@ -54,8 +54,17 @@ DOCS = {
     "java": "https://docs.veracode.com/r/compilation_java",
     "dotnet": "https://docs.veracode.com/r/compilation_net",
     "js": "https://docs.veracode.com/r/compilation_jscript",
-    "creds": "https://docs.veracode.com/r/t_create_api_creds",
-    "sca_agent": "https://docs.veracode.com/r/t_sc_cli_agent",
+    "languages": "https://docs.veracode.com/r/r_supported_table",
+    "pipeline_languages": "https://docs.veracode.com/r/Pipeline_Scan_Supported_Languages",
+    "apple": "https://docs.veracode.com/r/compilation_apple_platforms",
+    "flutter": "https://docs.veracode.com/r/Dart_and_Flutter_Application_Packaging",
+    "ruby": "https://docs.veracode.com/r/compilation_ruby",
+    "coldfusion": "https://docs.veracode.com/r/compilation_CF",
+    "cpp": "https://docs.veracode.com/r/C_Cplus_preprocessed_source_packaging",
+    "go": "https://docs.veracode.com/r/compilation_go",
+    "asp": "https://docs.veracode.com/r/compilation_ASPclassic",
+    "creds": "https://docs.veracode.com/r/c_api_credentials3",
+    "sca_agent": "https://docs.veracode.com/r/Manage_agents_and_scans",
     "tool": "https://github.com/ancient-cthulhu/Veracode-Pipeline-Inject",
 }
 
@@ -270,39 +279,66 @@ def wrap_block(body: list[str], indent: int, eol: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 MIN_LANGUAGE_BYTES = 200
-SAST_LANGUAGES = {
-    "C#", "F#", "Visual Basic .NET", "ASP.NET", "Go", "Java", "Groovy", "JavaScript", "TypeScript",
-    "Vue", "JSX", "Svelte", "Kotlin", "PHP", "Python", "Ruby", "Scala", "Apex", "ColdFusion", "C", "C++",
+# Veracode Static Analysis languages: https://docs.veracode.com/r/r_supported_table
+# Pipeline Scan supports a subset: https://docs.veracode.com/r/Pipeline_Scan_Supported_Languages
+# Language -> build family whose output the scan needs (https://docs.veracode.com/r/compilation_packaging).
+BUILD_LANGS = {
+    "Java": "jvm", "Kotlin": "jvm", "Scala": "jvm", "Groovy": "jvm",
+    "C#": "dotnet", "Visual Basic .NET": "dotnet", "ASP.NET": "dotnet",
+    "C": "native", "C++": "native", "Swift": "apple", "Objective-C": "apple",
+    "Dart": "flutter", "Ruby": "rails", "ColdFusion": "coldfusion",
 }
-COMPILED_LANGS = {"Java", "Kotlin", "Scala", "Groovy", "C#", "F#", "Visual Basic .NET", "ASP.NET", "C", "C++"}
-SOURCE_LANGS = SAST_LANGUAGES - COMPILED_LANGS
-# Languages found but not scanned by this tool, with the reason shown in the plan.
+# Scanned from a source archive.
+SOURCE_SAST = {"JavaScript", "TypeScript", "Vue", "JSX", "Python", "PHP", "Go", "Apex", "COBOL",
+               "Perl", "PLSQL", "TSQL", "Classic ASP", "Visual Basic 6.0", "RPG"}
+SAST_LANGUAGES = set(BUILD_LANGS) | SOURCE_SAST
+COMPILED_LANGS = set(BUILD_LANGS)
+SOURCE_LANGS = SOURCE_SAST
+# Static Analysis only (not in the Pipeline Scan list).
+POLICY_ONLY = {"Dart", "Perl", "PLSQL", "TSQL", "Classic ASP", "Visual Basic 6.0", "RPG"}
+# Source languages strong enough to add a source archive next to binaries (rarely build tooling).
+STANDALONE_SOURCE = {"Apex", "COBOL", "PLSQL", "TSQL", "Classic ASP", "Visual Basic 6.0", "RPG"}
+# Languages found but never scanned, with the reason shown in the plan.
 SAST_TIERS = [
-    ("needs a macOS/Xcode build", {"Swift", "Objective-C"}),
-    ("no build output this tool can package", {"COBOL"}),
-    ("no Pipeline Scan support", {"Perl", "PLSQL", "PL/SQL", "TSQL", "Classic ASP", "RPG",
-                                  "Visual Basic 6.0", "VBA", "Dart"}),
+    ("not supported by Veracode SAST", {"F#", "Svelte", "CoffeeScript", "VBA", "Rust", "Elixir"}),
 ]
 SAST_BUILD_EVIDENCE = {
     lang: ({"makefile", "gnumakefile", "cmakelists.txt", "meson.build", "build.ninja", "configure.ac",
             "configure", "sconstruct"}, (".vcxproj", ".vcproj", ".mk", ".bb"))
     for lang in ("C", "C++")
 }
-LANGUAGE_ALIASES = {"TSX": "TypeScript", "Objective-C++": "Objective-C",
-                    "ColdFusion CFC": "ColdFusion", "Java Server Pages": "Java"}
+LANGUAGE_ALIASES = {"TSX": "TypeScript", "Objective-C++": "Objective-C", "ColdFusion CFC": "ColdFusion",
+                    "Java Server Pages": "Java", "RPGLE": "RPG", "Groovy Server Pages": "Groovy"}
 CODE_EXTENSIONS = {
     ".cs": "C#", ".cshtml": "C#", ".razor": "C#", ".fs": "F#", ".vb": "Visual Basic .NET",
     ".go": "Go", ".java": "Java", ".jsp": "Java", ".groovy": "Groovy",
     ".js": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript", ".jsx": "JavaScript",
     ".ts": "TypeScript", ".tsx": "TypeScript", ".mts": "TypeScript", ".cts": "TypeScript",
-    ".vue": "Vue", ".svelte": "Svelte", ".kt": "Kotlin", ".kts": "Kotlin", ".py": "Python",
-    ".rb": "Ruby", ".erb": "Ruby", ".scala": "Scala", ".php": "PHP", ".dart": "Dart",
-    ".pl": "Perl", ".pm": "Perl", ".cfm": "ColdFusion", ".cfc": "ColdFusion",
-    ".cls": "Apex", ".trigger": "Apex", ".c": "C", ".cpp": "C++", ".cc": "C++", ".cxx": "C++",
-    ".hpp": "C++", ".hh": "C++", ".h": "C", ".swift": "Swift", ".m": "Objective-C",
-    ".mm": "Objective-C", ".cbl": "COBOL", ".cob": "COBOL", ".rs": "Rust", ".ex": "Elixir",
-    ".exs": "Elixir",
+    ".vue": "Vue", ".svelte": "Svelte", ".coffee": "CoffeeScript", ".kt": "Kotlin", ".kts": "Kotlin",
+    ".py": "Python", ".rb": "Ruby", ".erb": "Ruby", ".scala": "Scala", ".php": "PHP", ".dart": "Dart",
+    ".pl": "Perl", ".pm": "Perl", ".plx": "Perl", ".pl5": "Perl",
+    ".cfm": "ColdFusion", ".cfml": "ColdFusion", ".cfc": "ColdFusion",
+    ".cls": "Apex", ".trigger": "Apex", ".tgr": "Apex", ".page": "Apex", ".component": "Apex",
+    ".cmp": "Apex", ".evt": "Apex", ".vfp": "Apex",
+    ".c": "C", ".cpp": "C++", ".cc": "C++", ".cxx": "C++", ".hpp": "C++", ".hh": "C++", ".h": "C",
+    ".swift": "Swift", ".m": "Objective-C", ".mm": "Objective-C",
+    ".cbl": "COBOL", ".cob": "COBOL", ".cobol": "COBOL", ".pco": "COBOL",
+    ".pkb": "PLSQL", ".pks": "PLSQL", ".pck": "PLSQL", ".pls": "PLSQL", ".prc": "PLSQL", ".fnc": "PLSQL",
+    ".tpb": "PLSQL", ".tps": "PLSQL",
+    ".asp": "Classic ASP", ".asa": "Classic ASP",
+    ".bas": "Visual Basic 6.0", ".frm": "Visual Basic 6.0", ".ctl": "Visual Basic 6.0",
+    ".vbp": "Visual Basic 6.0", ".vbg": "Visual Basic 6.0",
+    ".rpg": "RPG", ".rpg4": "RPG", ".rpgle": "RPG",
+    ".rs": "Rust", ".ex": "Elixir", ".exs": "Elixir",
 }
+APEX_EXTENSIONS = (".cls", ".trigger", ".tgr", ".page", ".component", ".cmp", ".evt", ".vfp")
+VB6_EXTENSIONS = (".bas", ".frm", ".ctl", ".vbp", ".vbg")
+PLSQL_EXTENSIONS = (".pkb", ".pks", ".pck", ".pls", ".prc", ".fnc", ".tpb", ".tps")
+PLSQL_PACKAGES = (".pkb", ".pks", ".pck")  # unambiguous; .pls/.prc/.fnc are also playlists etc.
+# Classic ASP gets its own upload (not with DLL/EXE or other languages).
+ASP_GLOBS = ["**/*.asp", "**/*.asa"]
+# Go: one module per upload, packaged separately (https://docs.veracode.com/r/compilation_go).
+GO_GLOBS = ["**/*.go", "**/go.mod", "**/go.sum"]
 # Agent-based SCA support: https://docs.veracode.com/r/Agent_Based_Scans (Supported languages).
 SCA_LANGUAGES = {"C#", "F#", "Visual Basic .NET", "ASP.NET", "Go", "Java", "Groovy", "JavaScript",
                  "TypeScript", "Vue", "JSX", "Svelte", "Kotlin", "PHP", "Python", "Scala", "Ruby",
@@ -359,7 +395,7 @@ MAKE_CLEAN_RE = re.compile(r"^clean\s*:", re.M)
 MAKE_APPLE_RE = re.compile(r"\b(?:xcodebuild|xcrun|notarytool)\b")  # macOS-only build; the agent's make runs on Linux
 # Manifests that show a first-party source-language project (not vendored static JS).
 SOURCE_PROJECT_NAMES = {"package.json", "requirements.txt", "pyproject.toml", "setup.py", "pipfile",
-                        "go.mod", "composer.json", "gemfile"}
+                        "go.mod", "composer.json"}
 IAC_FILE_NAMES = {
     "dockerfile", "containerfile", ".dockerignore", "docker-compose.yml", "docker-compose.yaml",
     "compose.yml", "compose.yaml", "chart.yaml", "values.yaml", "kustomization.yaml",
@@ -404,7 +440,12 @@ TOOLING_BASENAMES = {
     "webpack.mix.js", "jest.setup.js", "protractor.conf.js", "karma.conf.js", "gulpfile.js",
     "gruntfile.js", ".eslintrc.js", ".eslintrc.cjs", "build.gradle.kts", "settings.gradle.kts",
 } | {f"{s}{e}" for s in _TOOLING_STEMS for e in (".js", ".cjs", ".mjs", ".ts", ".mts", ".cts")}
-FRAMEWORK_PLATFORM_DIRS = {"pubspec.yaml": ("android", "ios", "linux", "macos", "windows", "web")}
+FRAMEWORK_PLATFORM_DIRS = {
+    "pubspec.yaml": ("android", "ios", "linux", "macos", "windows", "web"),       # Flutter
+    "metro.config.js": ("android", "ios"), "metro.config.cjs": ("android", "ios"),  # React Native
+    "capacitor.config.json": ("android", "ios"), "capacitor.config.ts": ("android", "ios"),
+    "ionic.config.json": ("android", "ios", "platforms"),
+}
 APPLE_CORROBORATION = ({"podfile", "podfile.lock", "info.plist", "cartfile", "package.swift"},
                        (".pbxproj", ".xcworkspacedata", ".xcscheme", ".swift", ".xcconfig"))
 SALESFORCE_CORROBORATION = ({"sfdx-project.json"}, {"force-app", "classes", "triggers", "aura", "lwc"})
@@ -423,6 +464,7 @@ class Detection:
     windows: str | None = None     # evidence for a Windows SCA runner
     runner_reason: str = ""
     source_projects: list = field(default_factory=list)
+    go_modules: list = field(default_factory=list)   # dirs holding go.mod ("" = repo root)
     truncated: bool = False
 
     @property
@@ -521,6 +563,8 @@ def detect(paths: list[str], linguist: dict | None = None, truncated: bool = Fal
         seg in SALESFORCE_CORROBORATION[1] for _, lp, _ in entries for seg in lp.split("/")[:-1])
     c_ok = any(b.endswith((".c", ".cpp", ".cc", ".cxx")) or b in ("makefile", "gnumakefile", "cmakelists.txt")
                for b in bases)
+    vb6_ok = any(b.endswith((".vbp", ".vbg")) for b in bases)
+    plsql_ok = any(b.endswith(PLSQL_PACKAGES) for b in bases)
     ext_bytes: dict[str, int] = {}
     unknown = set()
     for p, lp, base in class_entries:
@@ -528,8 +572,11 @@ def detect(paths: list[str], linguist: dict | None = None, truncated: bool = Fal
             continue
         lang = _ext_language(base)
         ext = base[base.rfind("."):] if lang else ""
-        if not lang or (ext == ".m" and not apple_ok) or (ext in (".cls", ".trigger") and not sf_ok) \
-                or (ext == ".h" and not c_ok):
+        if ext == ".cls" and not sf_ok:
+            lang = "Visual Basic 6.0" if vb6_ok else None
+        if not lang or (ext == ".m" and not apple_ok) or (ext in APEX_EXTENSIONS and lang == "Apex" and not sf_ok) \
+                or (ext == ".h" and not c_ok) or (ext in VB6_EXTENSIONS and not vb6_ok) \
+                or (ext in PLSQL_EXTENSIONS and not plsql_ok):
             continue
         size = sizes.get(p)
         if size is None:
@@ -547,15 +594,34 @@ def detect(paths: list[str], linguist: dict | None = None, truncated: bool = Fal
     sast = langs & SAST_LANGUAGES
     evidence = {lp.rsplit("/", 1)[-1] for lp in lower if not (fw and lp.startswith(fw))}
     no_build = set()
+    # Veracode scans these only in specific project shapes; anything else is named, not scanned.
+    shape: dict[str, str] = {}
     if not truncated:
         for lang, (names, suffixes) in SAST_BUILD_EVIDENCE.items():
             if lang in sast and not any(b in names or b.endswith(suffixes) for b in evidence):
                 no_build.add(lang)
-    det.sast_langs = sast - no_build
+        mobile_dirs = tuple(d for d in fw if d.endswith(("/android/", "/ios/")) or d in ("android/", "ios/"))
+        checks = {
+            "Swift": (any(b.endswith((".pbxproj", ".xcworkspacedata")) for b in bases),
+                      "no Xcode project; Veracode scans Apple platform apps"),
+            "Objective-C": (any(b.endswith((".pbxproj", ".xcworkspacedata")) for b in bases),
+                            "no Xcode project; Veracode scans Apple platform apps"),
+            "Dart": ("pubspec.yaml" in evidence and any(lp.startswith(mobile_dirs) for lp in lower),
+                     "not a Flutter mobile app; Veracode scans Flutter APK/IPA builds"),
+            "Ruby": (any(lp == "config/application.rb" or lp.endswith("/config/application.rb") for lp in lower),
+                     "not a Rails app; Veracode scans Ruby on Rails only"),
+            "PLSQL": (plsql_ok, "no .pkb/.pks/.pck package files; set sast: on to scan it"),
+            "TSQL": (any(b.endswith(".sqlproj") for b in bases), "no .sqlproj; set sast: on to scan it"),
+            "Visual Basic 6.0": (vb6_ok, "no .vbp/.vbg project"),
+        }
+        shape = {lang: why for lang, (ok, why) in checks.items() if lang in sast and not ok}
+    det.sast_langs = sast - no_build - set(shape)
     not_counted = [f"{l} ({why})" for why, members in SAST_TIERS for l in sorted(langs & members)]
+    not_counted += [f"{l} ({why})" for l, why in sorted(shape.items())]
     not_counted += [f"{l} (no Makefile/CMake/vcxproj)" for l in sorted(no_build)]
     if det.sast_langs:
-        det.sast_reason = f"languages: {', '.join(sorted(det.sast_langs))}"
+        det.sast_reason = "languages: " + ", ".join(
+            f"{l} (Policy Scan only)" if l in POLICY_ONLY else l for l in sorted(det.sast_langs))
         if not_counted:
             det.sast_reason += f"; not scanned: {', '.join(not_counted[:6])}"
     elif truncated:
@@ -564,7 +630,7 @@ def detect(paths: list[str], linguist: dict | None = None, truncated: bool = Fal
         det.sast_reason = f"off: {', '.join(not_counted[:6])}"
     else:
         found = sorted(langs)[:8]
-        det.sast_reason = "off: no Pipeline Scan language" + (f" (found {', '.join(found)})" if found else "")
+        det.sast_reason = "off: no language Veracode SAST supports" + (f" (found {', '.join(found)})" if found else "")
     if not det.sast_langs and small:
         det.sast_reason += "; below " + str(MIN_LANGUAGE_BYTES) + " bytes (stub): " + \
             ", ".join(f"{l} {b} B" for l, b in sorted(small.items()))
@@ -608,6 +674,12 @@ def detect(paths: list[str], linguist: dict | None = None, truncated: bool = Fal
                 det.sca_make = mk
             else:
                 make_reason = f"{mk} has no gcc/g++/clang/CMake build or no clean target, which the agent needs"
+    mods = []
+    for p, lp, base in entries:
+        segs = lp.split("/")[:-1]
+        if base == "go.mod" and not any(s in ("testdata",) or s.startswith(("_", ".")) for s in segs):
+            mods.append("/".join(p.replace("\\", "/").split("/")[:-1]))
+    det.go_modules = sorted(mods, key=lambda d: (d.count("/") + bool(d), d))
     det.sca = bool(enabling) or truncated
     if enabling:
         det.sca_reason = f"manifests: {', '.join(sorted(enabling)[:5])} ({', '.join(sorted(ecos))})"
@@ -687,6 +759,10 @@ BINARY_TOOLS = [
     ("gradle", re.compile(r"(?:^|[\s/])gradlew?(?:\.bat)?\b[^\n]*?\b(?:build|assemble\w*|jar|war|bootJar|bootWar|shadowJar)\b")),
     ("sbt", re.compile(r"(?:^\s*|[;&|]\s*)sbt\b[^\n]*?\b(?:package|assembly|universal:packageBin)\b", re.M)),
     ("ant", re.compile(r"(?:^\s*|[;&|]\s*)ant(?:\s|$)", re.M)),
+    ("grails", re.compile(r"(?:^|[\s/])grailsw?\b[^\n]*?\b(?:assemble|war|package)\b")),
+    ("flutter", re.compile(r"\bflutter\s+build\s+(?:apk|appbundle|ipa)\b")),
+    ("xcode", re.compile(r"\bxcodebuild\b[^\n]*\barchive\b")),
+    ("rails", re.compile(r"\bveracode\s+prepare\b")),
     ("dotnet-publish", re.compile(r"\bdotnet\s+publish\b")),
     ("dotnet", re.compile(r"\bdotnet\s+build\b|\bmsbuild(?:\.exe)?\b")),
     ("native", re.compile(r"(?:^\s*|[;&|]\s*)(?:make|cmake\s+--build|ninja)(?:\s|$)", re.M)),
@@ -696,22 +772,46 @@ ANCHOR_RE = re.compile(
     r"|\bpoetry\s+(?:install|build)\b|\buv\s+(?:sync|build)\b|\btox\b|\bnox\b"
     r"|\bgo\s+(?:build|test|vet)\b|\bcomposer\s+install\b|\bbundle\s+(?:install|exec)\b"
     r"|\bpython3?\s+-m\s+(?:build|pytest|pip)\b|\bmvnw?\b|\bgradlew?\b|\bdotnet\s+\w+|\bmsbuild\b|\bmake\b"
-    r"|\bsbt\b|\bant\b")
+    r"|\bsbt\b|\bant\b|\bflutter\s+(?:test|build|pub)\b|\bxcodebuild\b|\bgrailsw?\b")
 BINARY_PATHS = {
     "maven": ["**/target/*.jar", "**/target/*.war", "**/target/*.ear",
               "!**/target/*-sources.jar", "!**/target/*-javadoc.jar", "!**/target/*-tests.jar"],
     "gradle": ["**/build/libs/*.jar", "**/build/libs/*.war", "**/build/outputs/apk/**/*.apk",
+               "**/build/outputs/bundle/**/*.aab",
                "!**/build/libs/*-sources.jar", "!**/build/libs/*-javadoc.jar",
                "!**/build/libs/*-plain.jar"],
+    "grails": ["**/build/libs/*.war", "**/build/libs/*.jar", "!**/build/libs/*-plain.jar",
+               "!**/build/libs/*-sources.jar", "!**/build/libs/*-javadoc.jar"],
+    "flutter": ["**/build/app/outputs/flutter-apk/*.apk", "**/build/ios/ipa/*.ipa"],
+    "xcode": ["**/*.xcarchive/**"],
+    "rails": ["**/tmp/veracode-*.zip"],
     "dotnet": ["**/bin/**/*.dll", "**/bin/**/*.exe", "**/bin/**/*.pdb"],
     "dotnet-publish": ["**/bin/**/publish/**/*.dll", "**/bin/**/publish/**/*.exe",
                        "**/bin/**/publish/**/*.pdb"],
-    "sbt": ["**/target/scala-*/*.jar", "!**/target/scala-*/*-sources.jar", "!**/target/scala-*/*-javadoc.jar"],
+    "sbt": ["**/target/scala-*/*.jar", "!**/target/scala-*/*-sources.jar", "!**/target/scala-*/*-javadoc.jar",
+            "!**/target/scala-*/*-sans-externalized.jar"],
     "ant": ["**/dist/**/*.jar", "**/dist/**/*.war", "**/dist/**/*.ear"],
     "native": [],
 }
 TOOL_LABEL = {"maven": "Maven", "gradle": "Gradle", "sbt": "sbt", "ant": "Ant", "dotnet": ".NET build",
-              "dotnet-publish": ".NET publish", "native": "native build"}
+              "dotnet-publish": ".NET publish", "native": "native build", "grails": "Grails",
+              "flutter": "Flutter", "xcode": "Xcode archive", "rails": "Veracode RubyGem"}
+TOOL_FAMILY = {"maven": "jvm", "gradle": "jvm", "sbt": "jvm", "ant": "jvm", "grails": "jvm",
+               "dotnet": "dotnet", "dotnet-publish": "dotnet", "native": "native", "xcode": "apple",
+               "flutter": "flutter", "rails": "rails"}
+# What each build family needs, for TODOs.
+FAMILY_HINT = {
+    "jvm": ("a Maven, Gradle, sbt, Ant or Grails build (JAR/WAR/EAR, compiled with debug info)", "java"),
+    "dotnet": ("dotnet build/publish or msbuild, with .pdb files", "dotnet"),
+    "native": ("a make/CMake build with debug symbols; set artifact_path to the binaries, or to .i/.ii "
+               "preprocessed files plus veracode.json", "cpp"),
+    "apple": ("a macOS job: xcodebuild archive (Debug, DEBUG_INFORMATION_FORMAT=dwarf-with-dsym), then gen-ir",
+              "apple"),
+    "flutter": ("`flutter build apk --debug`", "flutter"),
+    "rails": ("the Veracode RubyGem: `veracode prepare` in a job where the Rails app can boot "
+              "(writes tmp/veracode-*.zip)", "ruby"),
+    "coldfusion": ("cfcompile -deploy, packaged as a WAR; set artifact_path to the WAR", "coldfusion"),
+}
 PREFERRED_JOB_RE = re.compile(r"build|package|compile|^ci$", re.I)
 TEST_JOB_RE = re.compile(r"test|check|verify", re.I)
 PREFERRED_WF = ("ci", "build", "main", "pipeline", "build-and-test", "maven", "gradle", "dotnet",
@@ -864,9 +964,12 @@ def _rank_jobs(wf: Workflow, job_ids: list[str]) -> list[str]:
     return [j for j in ranked if _job_key(wf, j) == _job_key(wf, ranked[0])] if ranked else []
 
 
-def choose_build(wf: Workflow, cfg: dict) -> tuple[BuildMatch | None, list[str]]:
-    """Return (build, other equally ranked job ids). The first job in file order wins ties."""
+def choose_build(wf: Workflow, cfg: dict, families: set | None = None) -> tuple[BuildMatch | None, list[str]]:
+    """Return (build, other equally ranked job ids). The first job in file order wins ties.
+    families: build families of the languages found; builds for them win over other builds."""
     matches = [m for m in find_builds(wf) if m.job not in JOB_IDS]
+    if families and not cfg.get("build_job"):
+        matches = [m for m in matches if TOOL_FAMILY.get(m.tool) in families] or matches
     if cfg.get("build_job"):
         job = cfg["build_job"]
         if job not in wf.jobs:
@@ -931,6 +1034,10 @@ class Plan:
     sca_runner: str | None = None   # set when the SCA job needs another runner (Windows)
     reasons: dict = field(default_factory=dict)
     sast_scans: list = field(default_factory=list)
+    source_zip: bool = False         # zip the repo source (git archive)
+    source_excludes: list = field(default_factory=list)
+    go_modules: list = field(default_factory=list)   # Go module dirs to package (one; "" = root)
+    go_skip: list = field(default_factory=list)      # other module dirs, removed from that package
     todos: list = field(default_factory=list)
     notes: list = field(default_factory=list)
 
@@ -987,6 +1094,9 @@ def scan_decisions(det: Detection, cfg: dict) -> dict:
         out["sast"] = (False, "off: no SAST scan selected (pipeline, policy)")
     elif cfg["sast"] == "on" and not det.sast:
         out["sast"] = (True, f"forced on by config ({det.sast_reason})")
+    elif det.sast_langs and det.sast_langs <= POLICY_ONLY and selected_scans(cfg) == ["pipeline"]:
+        out["sast"] = (False, f"off: Pipeline Scan doesn't support {', '.join(sorted(det.sast_langs))}; "
+                              "they need the Policy Scan (policy)")
     else:
         out["sast"] = (det.sast, det.sast_reason)
     if cfg["sca"] == "off":
@@ -1002,6 +1112,23 @@ def scan_decisions(det: Detection, cfg: dict) -> dict:
     else:
         out["runner"] = (None, det.runner_reason)
     return out
+
+
+def _build_todos(wf: Workflow, build: BuildMatch, plan: Plan) -> None:
+    """Packaging requirements the build step itself must meet."""
+    steps = wf.steps(build.job)
+    text = step_text(steps[build.step]) if build.step < len(steps) else ""
+    if build.tool == "flutter":
+        if "appbundle" in text:
+            plan.todos.append(f"Veracode scans Flutter APK/IPA builds, not app bundles: `flutter build apk --debug` "
+                              f"({DOCS['flutter']})")
+        elif "--debug" not in text:
+            plan.todos.append(f"Veracode needs a debug Flutter build: `flutter build apk --debug` ({DOCS['flutter']})")
+    elif build.tool == "xcode" and not any("gen-ir" in step_text(s) for s in steps):
+        plan.todos.append("Run gen-ir on the build log and the archive after `xcodebuild archive` (Debug, "
+                          f"DEBUG_INFORMATION_FORMAT=dwarf-with-dsym) in job `{build.job}` ({DOCS['apple']})")
+    elif build.tool == "rails":
+        plan.notes.append("Veracode RubyGem: config.cache_classes and config.eager_load must be false")
 
 
 def make_plan(wf: Workflow, det: Detection, cfg: dict) -> Plan:
@@ -1033,10 +1160,19 @@ def make_plan(wf: Workflow, det: Detection, cfg: dict) -> Plan:
 
     if not dec["sast"][0]:
         return plan
+    scanned = set(det.sast_langs)
+    asp_alone = False
+    if "Classic ASP" in scanned and len(scanned) > 1:
+        scanned.discard("Classic ASP")
+        asp_alone = True
+        plan.todos.append("Classic ASP is left out of this scan: Veracode advises against uploading it with other "
+                          "languages (results are delayed) or with DLL/EXE files. Scan it in its own application "
+                          f"profile ({DOCS['asp']})")
     want_compiled = bool(det.compiled) or cfg["sast"] == "on" or (det.truncated and not det.sast_langs)
-    want_source = bool(det.source)
+    want_source = bool(scanned & SOURCE_LANGS)
+    families = {BUILD_LANGS[lang] for lang in det.compiled}
 
-    build, others = choose_build(wf, cfg)
+    build, others = choose_build(wf, cfg, families)
     if others and (want_compiled or cfg.get("build_job")):
         if cfg.get("strict"):
             raise Skip(f"several jobs build the code ({', '.join([build.job, *others])}); "
@@ -1047,7 +1183,17 @@ def make_plan(wf: Workflow, det: Detection, cfg: dict) -> Plan:
         plan.build = build
         plan.needs = build.job
         # Binaries cover the compiled code; add source only for a real JS/Python/... project.
-        plan.sast_mode = "binary+source" if want_source and det.source_projects else "binary"
+        extra_source = det.source_projects or (scanned & STANDALONE_SOURCE)
+        plan.sast_mode = "binary+source" if want_source and extra_source else "binary"
+        covered = TOOL_FAMILY.get(build.tool)
+        missing = sorted(lang for lang in det.compiled if BUILD_LANGS[lang] != covered)
+        if missing and covered and not cfg.get("artifact_path"):
+            for fam in sorted({BUILD_LANGS[lang] for lang in missing}):
+                langs_ = ", ".join(lang for lang in missing if BUILD_LANGS[lang] == fam)
+                hint, doc = FAMILY_HINT[fam]
+                plan.todos.append(f"SAST for {langs_} needs {hint}; the `{build.job}` build doesn't produce it "
+                                  f"({DOCS[doc]})")
+        _build_todos(wf, build, plan)
         reuse = None if cfg.get("artifact_path") else existing_upload(wf, build)
         if reuse:
             plan.reuse = reuse
@@ -1068,11 +1214,46 @@ def make_plan(wf: Workflow, det: Detection, cfg: dict) -> Plan:
     elif det.compiled:
         if want_source:
             plan.sast_mode = "source"
-        plan.todos.append(f"SAST for {', '.join(sorted(det.compiled))} needs a build step "
-                          "(Maven, Gradle, dotnet, msbuild or make) in this workflow. Re-run with "
-                          f"--build-job/--artifact-path. Packaging guide: {DOCS['packaging']}")
+        for fam in sorted(families):
+            langs_ = ", ".join(sorted(lang for lang in det.compiled if BUILD_LANGS[lang] == fam))
+            hint, doc = FAMILY_HINT[fam]
+            plan.todos.append(f"SAST for {langs_} needs {hint} in this workflow. Re-run with "
+                              f"--build-job/--artifact-path ({DOCS[doc]})")
     elif want_source:
         plan.sast_mode = "source"
+
+    if "source" in plan.sast_mode:
+        src = scanned & SOURCE_LANGS
+        if "Go" in src and det.go_modules:
+            plan.go_modules, plan.go_skip = det.go_modules[:1], det.go_modules[1:]
+            if plan.go_skip:
+                shown = ", ".join(plan.go_skip[:5]) + (f" and {len(plan.go_skip) - 5} more" if len(plan.go_skip) > 5 else "")
+                plan.todos.append(f"{len(det.go_modules)} Go modules; only `{plan.go_modules[0] or '.'}` is scanned "
+                                  "(Veracode takes one Go module per upload). Scan the others in their own "
+                                  f"application profiles: {shown} ({DOCS['go']})")
+        plan.source_excludes = (ASP_GLOBS if asp_alone else []) + (GO_GLOBS if plan.go_modules else [])
+        plan.source_zip = bool(src - {"Go"}) or not plan.go_modules
+
+    # What this scan actually covers decides Pipeline Scan vs Policy Scan only.
+    included = set()
+    if plan.sast_mode.startswith("binary") and plan.build:
+        fam = TOOL_FAMILY.get(plan.build.tool)
+        included |= {lang for lang in det.compiled if BUILD_LANGS[lang] == fam or not fam}
+    if "source" in plan.sast_mode:
+        included |= scanned & SOURCE_LANGS
+    policy_only = sorted(included & POLICY_ONLY)
+    if policy_only and "pipeline" in plan.sast_scans:
+        if set(policy_only) == included:
+            plan.sast_scans = [s for s in plan.sast_scans if s != "pipeline"]
+            plan.notes.append(f"Pipeline Scan doesn't support {', '.join(policy_only)}; only the Policy Scan is added")
+        else:
+            plan.notes.append(f"Pipeline Scan skips {', '.join(policy_only)}; the Policy Scan covers it")
+    if plan.sast_mode != "off" and not plan.sast_scans:
+        plan.sast_mode = "off"
+        plan.todos.append(f"SAST is off: {', '.join(policy_only)} need the Policy Scan (--policy)")
+    if plan.sast_mode == "binary" and scanned & SOURCE_LANGS - included:
+        plan.notes.append(f"Not in the scan: {', '.join(sorted(scanned & SOURCE_LANGS - included))} (no project "
+                          "files next to the binary build, so treated as build scripts)")
 
     if plan.sast_mode == "source":
         anchors = anchor_jobs(wf)
@@ -1087,33 +1268,62 @@ def make_plan(wf: Workflow, det: Detection, cfg: dict) -> Plan:
 # Rendering
 # --------------------------------------------------------------------------- #
 
-PREPARE_SCRIPT = r'''import json, os, pathlib, shutil, subprocess, zipfile
+PREPARE_SCRIPT = r'''import io, json, os, pathlib, re, shutil, subprocess, tarfile, zipfile
 DOCS = "https://docs.veracode.com/r/"
 build, out = pathlib.Path("veracode-build"), pathlib.Path("veracode-units")
 out.mkdir(exist_ok=True)
 def warn(msg, page="compilation_packaging"):
     print(f"::warning title=Veracode packaging::{msg} See {DOCS}{page}")
 files = sorted(p for p in build.rglob("*") if p.is_file()) if build.is_dir() else []
-JAVA = (".jar", ".war", ".ear", ".apk", ".aab")
+JAVA = (".jar", ".war", ".ear", ".apk", ".aab", ".ipa")
+ARCHIVES = (".zip",)  # prebuilt packages, e.g. the Veracode RubyGem output
 NATIVE = (".dll", ".exe", ".pdb", ".so", ".dylib")
-SKIP = ("-sources.jar", "-javadoc.jar", "-tests.jar", "-plain.jar")
+PRE = (".i", ".ii")
+SKIP = ("-sources.jar", "-javadoc.jar", "-tests.jar", "-plain.jar", "-sans-externalized.jar")
 units = []
-def add(src):
-    dest, n = out / src.name, 1
+def dest_for(name):
+    dest, n = out / name, 1
+    stem, suffix = (name[:-7], ".tar.gz") if name.lower().endswith(".tar.gz") else (pathlib.Path(name).stem, pathlib.Path(name).suffix)
     while dest.exists():
-        dest, n = out / f"{src.stem}-{n}{src.suffix}", n + 1
+        dest, n = out / f"{stem}-{n}{suffix}", n + 1
+    return dest
+def add(src):
+    dest = dest_for(src.name)
     shutil.copyfile(src, dest)
     units.append(dest.name)
+def zip_tree(dest, members, root, prefix=""):
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in members:
+            z.write(p, str(pathlib.PurePosixPath(prefix, p.relative_to(root).as_posix())) if prefix else p.relative_to(root))
+    units.append(dest.name)
+# Apple: each .xcarchive folder becomes one zip with the folder at its root.
+xcarchives, rest = {}, []
 for p in files:
-    if p.name.lower().endswith(JAVA) and not p.name.lower().endswith(SKIP):
+    parts = p.relative_to(build).parts
+    i = next((k for k, s in enumerate(parts[:-1]) if s.endswith(".xcarchive")), None)
+    if i is None:
+        rest.append(p)
+    else:
+        xcarchives.setdefault(build.joinpath(*parts[:i + 1]), []).append(p)
+for root, members in sorted(xcarchives.items()):
+    zip_tree(dest_for(root.name[:-len(".xcarchive")] + ".zip"), members, root, root.name)
+    if not any("dSYMs" in p.parts for p in members):
+        warn(f"{root.name} has no dSYMs. Archive a Debug build with DEBUG_INFORMATION_FORMAT=dwarf-with-dsym and run gen-ir.", "compilation_apple_platforms")
+files = rest
+for p in files:
+    n = p.name.lower()
+    if (n.endswith(JAVA) and not n.endswith(SKIP)) or n.endswith(ARCHIVES):
         add(p)
+# C/C++ preprocessed source: .i/.ii files plus veracode.json, directories kept.
+pre = [p for p in files if p.suffix.lower() in PRE or p.name.lower() == "veracode.json"]
+if any(p.suffix.lower() in PRE for p in pre):
+    zip_tree(dest_for("veracode-cpp-preprocessed.zip"), pre, build)
+    if not any(p.name.lower() == "veracode.json" for p in pre):
+        warn("Preprocessed .i/.ii files without veracode.json. Each directory with them needs a veracode.json describing the compiler.", "C_Cplus_preprocessed_source_packaging")
 native = [p for p in files if p.suffix.lower() in NATIVE]
 if native:
-    with zipfile.ZipFile(out / "veracode-binaries.zip", "w", zipfile.ZIP_DEFLATED) as z:
-        for p in files:
-            if not p.name.lower().endswith(JAVA):
-                z.write(p, p.relative_to(build))
-    units.append("veracode-binaries.zip")
+    packaged = JAVA + ARCHIVES + PRE
+    zip_tree(dest_for("veracode-binaries.zip"), [p for p in files if not p.name.lower().endswith(packaged) and p.name.lower() != "veracode.json"], build)
     bins = [p for p in native if p.suffix.lower() in (".dll", ".exe")]
     if bins and not any(p.suffix.lower() == ".pdb" for p in native):
         warn("No .pdb files next to the .dll/.exe files. Build with debug symbols (portable PDBs) so findings show file and line.", "compilation_net")
@@ -1121,15 +1331,54 @@ if native:
     if tests:
         warn(f"Test assemblies in the build output ({', '.join(tests[:5])}). Exclude test projects from the upload path.", "compilation_net")
 if os.environ.get("SOURCE_ZIP") == "true":
-    subprocess.run(["git", "archive", "--format=zip", "-o", str(out / "veracode-source.zip"), "HEAD"], check=True)
-    units.append("veracode-source.zip")
-    with zipfile.ZipFile(out / "veracode-source.zip") as z:
-        names = z.namelist()
-    if any("node_modules/" in n for n in names):
-        warn("node_modules is committed to the repository. Remove it from the scanned source.", "compilation_jscript")
-    js = [n for n in names if n.endswith(".js")]
-    if js and all(n.endswith(".min.js") for n in js):
-        warn("Only minified JavaScript found. Scan the unminified source.", "compilation_jscript")
+    excludes = json.loads(os.environ.get("SOURCE_EXCLUDES") or "[]")
+    spec = ["--", "."] + [f":(exclude,glob){g}" for g in excludes] if excludes else []
+    dest = out / "veracode-source.zip"
+    res = subprocess.run(["git", "archive", "--format=zip", "-o", str(dest), "HEAD", *spec], capture_output=True, text=True)
+    if res.returncode != 0:
+        warn(f"git archive failed: {res.stderr.strip()[-300:]}")
+    else:
+        units.append(dest.name)
+        with zipfile.ZipFile(dest) as z:
+            names = z.namelist()
+        if any("node_modules/" in n for n in names):
+            warn("node_modules is committed to the repository. Remove it from the scanned source.", "compilation_jscript")
+        js = [n for n in names if n.endswith(".js")]
+        if js and all(n.endswith(".min.js") for n in js):
+            warn("Only minified JavaScript found. Scan the unminified source.", "compilation_jscript")
+# Go: one zip per module, go.mod at the top of the module folder, dependencies vendored.
+modules = json.loads(os.environ.get("GO_MODULES") or "[]")
+others = modules + json.loads(os.environ.get("GO_SKIP") or "[]")
+for d in modules:
+    name = re.sub(r"[^A-Za-z0-9._-]", "-", pathlib.PurePosixPath(d).name if d else "app")
+    stage = pathlib.Path("veracode-go") / name
+    while stage.exists():
+        stage = stage.with_name(stage.name + "_")
+    stage.mkdir(parents=True)
+    tar = subprocess.run(["git", "archive", "--format=tar", f"HEAD:{d}" if d else "HEAD"], capture_output=True, check=True).stdout
+    with tarfile.open(fileobj=io.BytesIO(tar)) as t:
+        try:
+            t.extractall(stage, filter="data")
+        except TypeError:
+            t.extractall(stage)
+    for other in others:  # one module per upload: drop nested modules
+        if other != d and (not d or other.startswith(d + "/")):
+            shutil.rmtree(stage / (other[len(d) + 1:] if d else other), ignore_errors=True)
+    gomod = (stage / "go.mod").read_text(errors="replace") if (stage / "go.mod").exists() else ""
+    if re.search(r"^\s*replace\b", gomod, re.M):
+        warn(f"{d or '.'}/go.mod uses replace directives, which Veracode can't resolve. Remove them for scanning.", "compilation_go")
+    go = shutil.which("go")
+    if go:
+        try:
+            res = subprocess.run([go, "mod", "vendor"], cwd=stage, capture_output=True, text=True, timeout=900)
+            if res.returncode != 0:
+                warn(f"go mod vendor failed in {d or '.'} ({res.stderr.strip()[-200:]}); scanned without vendored dependencies.", "compilation_go")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            warn(f"go mod vendor didn't run in {d or '.'} ({type(exc).__name__}); scanned without vendored dependencies.", "compilation_go")
+    else:
+        warn("Go isn't installed on this runner, so dependencies weren't vendored.", "compilation_go")
+    zip_tree(dest_for(f"veracode-go-{stage.name}.zip"), sorted(p for p in stage.rglob("*") if p.is_file()), stage, stage.name)
+shutil.rmtree("veracode-go", ignore_errors=True)
 for name in units:
     path = out / name
     if path.suffix.lower() in (".jar", ".war", ".ear"):
@@ -1223,7 +1472,7 @@ def render_jobs(plan: Plan, cfg: dict, actions: dict) -> list[str]:
     runner = _yq(str(cfg["runner"]))
     out: list[str] = []
     perms = ["  permissions:", "    contents: read"]
-    scans = selected_scans(cfg)
+    scans = plan.sast_scans
     has_units = "needs.veracode-prepare.outputs.units != '[]'"
     if plan.sast_mode != "off" and scans:
         out += ["veracode-prepare:", "  name: Veracode SAST prepare"]
@@ -1238,6 +1487,13 @@ def render_jobs(plan: Plan, cfg: dict, actions: dict) -> list[str]:
         source = "source" in plan.sast_mode
         if source:
             out += ["    - name: Checkout", f"      uses: {actions['checkout']}"]
+        env = [f"        SOURCE_ZIP: '{'true' if source and plan.source_zip else 'false'}'"]
+        if plan.source_excludes:
+            env.append(f"        SOURCE_EXCLUDES: {_yq(json.dumps(plan.source_excludes))}")
+        if plan.go_modules:
+            env.append(f"        GO_MODULES: {_yq(json.dumps(plan.go_modules))}")
+        if plan.go_skip:
+            env.append(f"        GO_SKIP: {_yq(json.dumps(plan.go_skip))}")
         if plan.sast_mode.startswith("binary"):
             out += ["    - name: Download build output", f"      uses: {actions['download']}", "      with:"]
             if plan.reuse and not plan.reuse[1]:
@@ -1247,8 +1503,7 @@ def render_jobs(plan: Plan, cfg: dict, actions: dict) -> list[str]:
                 out += [f"        pattern: {_yq(pattern)}", "        merge-multiple: true"]
             out.append(f"        path: {BUILD_ARTIFACT}")
         out += ["    - name: Package and check for Veracode", "      id: units", "      shell: bash",
-                "      env:", f"        SOURCE_ZIP: '{'true' if source else 'false'}'",
-                "      run: |", "        python3 - <<'PY'"]
+                "      env:", *env, "      run: |", "        python3 - <<'PY'"]
         out += [f"        {line}" if line else "" for line in PREPARE_SCRIPT.splitlines()]
         out += ["        PY",
                 "    - name: Upload scan units", "      if: steps.units.outputs.units != '[]'",
