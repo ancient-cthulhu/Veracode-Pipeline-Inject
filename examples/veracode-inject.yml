@@ -6,6 +6,9 @@ defaults:
   branch_fail_on_severity: ""          # empty = any flaw fails branch pushes
   runner: ubuntu-latest
   sast: auto                           # auto | on | off
+  pipeline: true                       # Pipeline Scan: branch pushes + PRs
+  policy: true                         # Policy Scan: pushes to the default branch
+  sandboxes: false                     # Sandbox scan: PRs into the default branch
   sca: auto                            # auto | on | off
   iac: "on"                            # on | artifacts | off (quote it: YAML reads bare on as true)
   windows_runner: windows-latest       # SCA runner for Windows-only .NET/C++ builds; "off" disables
@@ -25,6 +28,9 @@ repos:
     runner: windows-latest             # Veracode jobs need bash, python3 and git
     build_job: build
     build_step: Publish
+  "my-org/regulated-*":
+    pipeline: false
+    sandboxes: true                    # sandbox per PR source branch + policy scan on merge
   "my-org/docs-*":
     sast: "off"
     sca: "off"

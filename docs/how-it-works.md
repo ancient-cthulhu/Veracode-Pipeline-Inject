@@ -43,6 +43,22 @@ Detection runs first, on the default branch, before any workflow is read. `--det
 - Windows only changes the SCA job's runner. SAST packaging runs on Linux, after the client's own build.
 - There's no per-repo `veracode.yml`. The decision is applied directly in the workflow.
 
+## Scans and events
+
+| Scan | Flag / config key | Runs on |
+|---|---|---|
+| Pipeline Scan | `--pipeline` / `pipeline` (default on) | Pushes to non-default branches, and pull requests. PRs gate on `pr_gate_policy`; branch pushes fail on any flaw or on `branch_fail_on_severity`. |
+| Policy Scan (Upload and Scan) | `--policy` / `policy` (default on) | Pushes to the default branch, which includes merges |
+| Sandbox scan (Upload and Scan) | `--sandboxes` / `sandboxes` (default off) | Pull requests whose base is the default branch. Sandbox = `github.head_ref` (the PR source branch), with `createsandbox: true` and `deleteincompletescan: true`. |
+| SCA (agent) | `sca` | Pull requests into the default branch, and pushes to it |
+| IaC/Secrets | `iac` | Every run |
+
+- Passing any of `--pipeline`, `--policy`, `--sandboxes` on the command line selects exactly those; the rest are off. With none of them, the config (or the defaults) applies.
+- `veracode-prepare` only runs on events where at least one selected SAST scan runs.
+- Fork PRs are skipped by every job, because they don't receive secrets.
+- Sandbox and policy uploads submit the scan and return; results appear in the Veracode Platform.
+- Sandboxes aren't deleted when a PR closes. Clean them up in the Platform, because each application profile has a sandbox limit.
+
 ## 2. Choosing the workflow
 
 | Rule | Result |
@@ -162,6 +178,8 @@ All come from read-only `--dry-run` / `--detect-only` runs against public reposi
 | Keep SCA on Linux for every repo | `--windows-runner off` |
 | Fix one repo the auto-detection skipped | `repos:` entry with `workflow` / `build_job` / `artifact_path` |
 | Gate branch pushes on severity, not on every flaw | `--branch-fail-on-severity "Very High, High"` |
+| Keep PR scan results on the Veracode Platform | `--sandboxes` (add `--pipeline` too for a fast PR gate) |
+| Only the compliance record, no PR scans | `--policy` |
 | Make SCA or IaC block merges | `--sca-blocking` / `--iac-blocking` |
 | Self-hosted runners | `--runner` (the label needs bash, python3 and git) |
 | Strict supply-chain policy | `--pin-sha` |

@@ -67,6 +67,9 @@ DEFAULTS = {
     "branch_fail_on_severity": "",
     "runner": "ubuntu-latest",
     "sast": "auto",              # auto | on | off
+    "pipeline": True,            # Pipeline Scan: branch pushes + PRs
+    "policy": True,              # Policy Scan: pushes to the default branch
+    "sandboxes": False,          # Sandbox scan: PRs into the default branch
     "sca": "auto",               # auto | on | off
     "iac": "on",                 # on | artifacts | off
     "windows_runner": "windows-latest",  # SCA runner for Windows-only .NET/C++ repos; "off" disables
@@ -79,7 +82,7 @@ CONFIG_KEYS = set(DEFAULTS)
 BEGIN = "# >>> veracode-pipeline-inject >>> managed block: re-run the tool to update it"
 END_PREFIX = "# <<< veracode-pipeline-inject <<<"
 JOB_IDS = ("veracode-prepare", "veracode-pipeline-scan", "veracode-policy-scan",
-           "veracode-sca", "veracode-iac")
+           "veracode-sandbox-scan", "veracode-sca", "veracode-iac")
 UPLOAD_STEP_NAME = "Upload build output for Veracode"
 BUILD_ARTIFACT = "veracode-build"
 TODO_PATH = "TODO-set-your-build-output-path"
@@ -821,6 +824,7 @@ class Plan:
     iac: bool = False
     sca_runner: str | None = None   # set when the SCA job needs another runner (Windows)
     reasons: dict = field(default_factory=dict)
+    sast_scans: list = field(default_factory=list)
     todos: list = field(default_factory=list)
     notes: list = field(default_factory=list)
 
@@ -831,6 +835,8 @@ class Plan:
             sast = f"{self.sast_mode} ({self.build.job}: {TOOL_LABEL.get(self.build.tool, self.build.tool)})"
         elif self.sast_mode == "source" and self.needs:
             sast = f"source (after {self.needs})"
+        if self.sast_mode != "off" and self.sast_scans:
+            sast += f" [{'+'.join(self.sast_scans)}]"
         sca = ("on" + (f" ({self.sca_runner})" if self.sca_runner else "")) if self.sca else "off"
         return {"sast": sast, "sca": sca, "iac": "on" if self.iac else "off"}
 
@@ -871,6 +877,8 @@ def scan_decisions(det: Detection, cfg: dict) -> dict:
     out = {}
     if cfg["sast"] == "off":
         out["sast"] = (False, "off by config")
+    elif not selected_scans(cfg):
+        out["sast"] = (False, "off: no SAST scan selected (pipeline, policy, sandboxes)")
     elif cfg["sast"] == "on" and not det.sast:
         out["sast"] = (True, f"forced on by config ({det.sast_reason})")
     else:
@@ -898,6 +906,7 @@ def make_plan(wf: Workflow, det: Detection, cfg: dict) -> Plan:
     plan.iac = dec["iac"][0]
     plan.sca = dec["sca"][0]
     plan.sca_runner = dec["runner"][0]
+    plan.sast_scans = selected_scans(cfg)
 
     trig = wf.triggers()
     if not trig & {"push", "pull_request"}:
@@ -908,6 +917,12 @@ def make_plan(wf: Workflow, det: Detection, cfg: dict) -> Plan:
             plan.notes.append("No pull_request trigger: PR gate scans will not run")
         if "push" not in trig:
             plan.notes.append("No push trigger: the policy scan on the default branch will not run")
+        if dec["sast"][0] and "sandboxes" in plan.sast_scans:
+            if "pull_request" not in trig:
+                plan.notes.append("Sandbox scans run on pull requests, but the workflow has no pull_request trigger")
+            else:
+                plan.notes.append("Sandboxes are named after the PR source branch and are not deleted when the PR "
+                                  "closes; remove stale ones in the Veracode Platform")
         if "pull_request" in trig and not push_runs_on(wf, cfg["branch"]):
             plan.notes.append(f"Pushes to `{cfg['branch']}` don't trigger this workflow; open a PR from it to test")
     conc = wf.data.get("concurrency")
@@ -1033,6 +1048,26 @@ with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
     fh.write(f"units={json.dumps(units)}\n")'''
 
 FORK_GUARD = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false"
+# Event conditions. PRs count only when they target the default branch (except the Pipeline Scan gate).
+ON_BRANCH_PUSH = "(github.event_name == 'push' && github.ref_name != github.event.repository.default_branch)"
+ON_DEFAULT_PUSH = "(github.event_name == 'push' && github.ref_name == github.event.repository.default_branch)"
+ON_PR_TO_DEFAULT = "(github.event_name == 'pull_request' && github.base_ref == github.event.repository.default_branch)"
+ON_ANY_PR = "github.event_name == 'pull_request'"
+SAST_SCANS = ("pipeline", "policy", "sandboxes")
+SAST_SCAN_EVENTS = {
+    "pipeline": [ON_ANY_PR, ON_BRANCH_PUSH],
+    "policy": [ON_DEFAULT_PUSH],
+    "sandboxes": [ON_PR_TO_DEFAULT],
+}
+SCAN_LABELS = {
+    "pipeline": "Pipeline Scan on branch pushes and PRs",
+    "policy": "Policy Scan on pushes to the default branch",
+    "sandboxes": "Sandbox scan (sandbox = PR source branch) on PRs into the default branch",
+}
+
+
+def selected_scans(cfg: dict) -> list[str]:
+    return [s for s in SAST_SCANS if cfg.get(s)]
 
 
 def _q(value: str) -> str:
@@ -1045,6 +1080,29 @@ def _yq(value: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_./@*!-]+", value) and not value.startswith(("*", "!", "-", "@")):
         return value
     return "'" + value.replace("'", "''") + "'"
+
+
+def _if_block(conds: list[str], guard: str | None = None) -> list[str]:
+    """Folded `if:` from OR-ed conditions, optionally AND-ed with a guard."""
+    lines = ["  if: >-"]
+    if guard:
+        lines.append(f"    ({guard}) &&")
+    if len(conds) == 1:
+        lines.append(f"    {conds[0]}")
+    else:
+        lines.append(f"    ({conds[0]} ||")
+        lines += [f"    {c} ||" for c in conds[1:-1]]
+        lines.append(f"    {conds[-1]})")
+    return lines
+
+
+def _download_units(actions: dict) -> list[str]:
+    return ["    - name: Download scan units", f"      uses: {actions['download']}", "      with:",
+            "        name: veracode-scan-units", "        path: veracode-units"]
+
+
+def _creds() -> list[str]:
+    return ["        vid: ${{ secrets.VERACODE_API_ID }}", "        vkey: ${{ secrets.VERACODE_API_KEY }}"]
 
 
 def render_upload_step(plan: Plan, cfg: dict, actions: dict) -> list[str]:
@@ -1064,11 +1122,17 @@ def render_jobs(plan: Plan, cfg: dict, actions: dict) -> list[str]:
     runner = _yq(str(cfg["runner"]))
     out: list[str] = []
     perms = ["  permissions:", "    contents: read"]
-    if plan.sast_mode != "off":
+    scans = selected_scans(cfg)
+    has_units = "needs.veracode-prepare.outputs.units != '[]'"
+    if plan.sast_mode != "off" and scans:
         out += ["veracode-prepare:", "  name: Veracode SAST prepare"]
         if plan.needs:
             out.append(f"  needs: {plan.needs}")
-        out += [f"  if: {FORK_GUARD}", f"  runs-on: {runner}", *perms,
+        events = list(dict.fromkeys(c for s in scans for c in SAST_SCAN_EVENTS[s]))
+        if ON_ANY_PR in events and ON_PR_TO_DEFAULT in events:
+            events.remove(ON_PR_TO_DEFAULT)
+        out += _if_block(events, FORK_GUARD)
+        out += [f"  runs-on: {runner}", *perms,
                 "  outputs:", "    units: ${{ steps.units.outputs.units }}", "  steps:"]
         source = "source" in plan.sast_mode
         if source:
@@ -1090,26 +1154,18 @@ def render_jobs(plan: Plan, cfg: dict, actions: dict) -> list[str]:
                 f"      uses: {actions['upload']}", "      with:", "        name: veracode-scan-units",
                 "        path: veracode-units/", f"        retention-days: {int(cfg['retention_days'])}"]
 
+    if plan.sast_mode != "off" and "pipeline" in scans:
         policy = cfg["pr_gate_policy"] or ""
         sev = cfg["branch_fail_on_severity"] or ""
-        out += [
-            "veracode-pipeline-scan:",
-            "  name: Veracode Pipeline Scan (${{ matrix.unit }})",
-            "  needs: veracode-prepare",
-            "  if: >-",
-            "    needs.veracode-prepare.outputs.units != '[]' &&",
-            "    (github.event_name == 'pull_request' ||",
-            "    (github.event_name == 'push' && github.ref_name != github.event.repository.default_branch))",
-            f"  runs-on: {runner}", *perms,
-            "  strategy:", "    fail-fast: false", "    matrix:",
-            "      unit: ${{ fromJSON(needs.veracode-prepare.outputs.units) }}",
-            "  steps:",
-            "    - name: Download scan units", f"      uses: {actions['download']}", "      with:",
-            "        name: veracode-scan-units", "        path: veracode-units",
-            "    - name: Veracode Pipeline Scan", f"      uses: {actions['pipeline']}", "      with:",
-            "        vid: ${{ secrets.VERACODE_API_ID }}", "        vkey: ${{ secrets.VERACODE_API_KEY }}",
-            "        file: veracode-units/${{ matrix.unit }}",
-        ]
+        out += ["veracode-pipeline-scan:", "  name: Veracode Pipeline Scan (${{ matrix.unit }})",
+                "  needs: veracode-prepare", "  if: >-", f"    {has_units} &&",
+                f"    ({ON_ANY_PR} ||", f"    {ON_BRANCH_PUSH})",
+                f"  runs-on: {runner}", *perms,
+                "  strategy:", "    fail-fast: false", "    matrix:",
+                "      unit: ${{ fromJSON(needs.veracode-prepare.outputs.units) }}",
+                "  steps:", *_download_units(actions),
+                "    - name: Veracode Pipeline Scan", f"      uses: {actions['pipeline']}", "      with:",
+                *_creds(), "        file: veracode-units/${{ matrix.unit }}"]
         if policy:
             out += ["        # PR: gate on the policy. Branch push: any flaw fails.",
                     f"        veracode_policy_name: ${{{{ github.event_name == 'pull_request' && {_q(policy)} || '' }}}}"]
@@ -1117,32 +1173,46 @@ def render_jobs(plan: Plan, cfg: dict, actions: dict) -> list[str]:
             out.append(f"        fail_on_severity: ${{{{ github.event_name != 'pull_request' && {_q(sev)} || '' }}}}")
         out += ["        fail_build: true", "        issue_details: true",
                 "        artifact_name: ${{ matrix.unit }}"]
-        out += [
-            "veracode-policy-scan:",
-            "  name: Veracode Policy Scan",
-            "  needs: veracode-prepare",
-            "  if: >-",
-            "    needs.veracode-prepare.outputs.units != '[]' &&",
-            "    github.event_name == 'push' && github.ref_name == github.event.repository.default_branch",
-            f"  runs-on: {runner}", *perms,
-            "  # Never cancel an in-flight policy upload.",
-            "  concurrency:", "    group: veracode-policy-${{ github.repository }}",
-            "    cancel-in-progress: false",
-            "  steps:",
-            "    - name: Download scan units", f"      uses: {actions['download']}", "      with:",
-            "        name: veracode-scan-units", "        path: veracode-units",
-            "    - name: Veracode Upload and Scan", f"      uses: {actions['policy']}", "      with:",
-            "        vid: ${{ secrets.VERACODE_API_ID }}", "        vkey: ${{ secrets.VERACODE_API_KEY }}",
-            "        appname: ${{ secrets.VERACODE_APP_NAME || github.repository }}",
-            "        createprofile: true",
-            "        filepath: veracode-units",
-            "        version: ${{ github.ref_name }}-${{ github.run_number }}-${{ github.run_attempt }}",
-        ]
+
+    if plan.sast_mode != "off" and "policy" in scans:
+        out += ["veracode-policy-scan:", "  name: Veracode Policy Scan", "  needs: veracode-prepare",
+                "  if: >-", f"    {has_units} &&", f"    {ON_DEFAULT_PUSH}",
+                f"  runs-on: {runner}", *perms,
+                "  # Never cancel an in-flight policy upload.",
+                "  concurrency:", "    group: veracode-policy-${{ github.repository }}",
+                "    cancel-in-progress: false",
+                "  steps:", *_download_units(actions),
+                "    - name: Veracode Upload and Scan", f"      uses: {actions['policy']}", "      with:",
+                *_creds(),
+                "        appname: ${{ secrets.VERACODE_APP_NAME || github.repository }}",
+                "        createprofile: true",
+                "        filepath: veracode-units",
+                "        version: ${{ github.ref_name }}-${{ github.run_number }}-${{ github.run_attempt }}"]
+
+    if plan.sast_mode != "off" and "sandboxes" in scans:
+        out += ["veracode-sandbox-scan:", "  name: Veracode Sandbox Scan", "  needs: veracode-prepare",
+                "  if: >-", f"    {has_units} &&", f"    {ON_PR_TO_DEFAULT}",
+                f"  runs-on: {runner}", *perms,
+                "  # One upload per sandbox at a time; a newer commit replaces an unfinished scan.",
+                "  concurrency:", "    group: veracode-sandbox-${{ github.repository }}-${{ github.head_ref }}",
+                "    cancel-in-progress: false",
+                "  steps:", *_download_units(actions),
+                "    - name: Veracode Upload and Scan (sandbox)", f"      uses: {actions['policy']}", "      with:",
+                *_creds(),
+                "        appname: ${{ secrets.VERACODE_APP_NAME || github.repository }}",
+                "        createprofile: true",
+                "        createsandbox: true",
+                "        sandboxname: ${{ github.head_ref }}",
+                "        deleteincompletescan: true",
+                "        filepath: veracode-units",
+                "        version: ${{ github.head_ref }}-${{ github.run_number }}-${{ github.run_attempt }}"]
+
     if plan.sca:
         sca_runner = _yq(plan.sca_runner) if plan.sca_runner else runner
-        out += ["veracode-sca:", "  name: Veracode SCA", f"  if: {FORK_GUARD}", f"  runs-on: {sca_runner}",
-                *perms, "  steps:", "    - name: Checkout", f"      uses: {actions['checkout']}",
-                "    - name: Veracode agent-based SCA"]
+        out += ["veracode-sca:", "  name: Veracode SCA",
+                *_if_block([ON_PR_TO_DEFAULT, ON_DEFAULT_PUSH], FORK_GUARD),
+                f"  runs-on: {sca_runner}", *perms, "  steps:", "    - name: Checkout",
+                f"      uses: {actions['checkout']}", "    - name: Veracode agent-based SCA"]
         if not cfg["sca_blocking"]:
             out.append("      continue-on-error: true")
         out += [f"      uses: {actions['sca']}", "      env:",
@@ -1157,8 +1227,7 @@ def render_jobs(plan: Plan, cfg: dict, actions: dict) -> list[str]:
                 f"      uses: {actions['checkout']}", "    - name: Veracode IaC and Secrets scan"]
         if not cfg["iac_blocking"]:
             out.append("      continue-on-error: true")
-        out += [f"      uses: {actions['iac']}", "      with:",
-                "        vid: ${{ secrets.VERACODE_API_ID }}", "        vkey: ${{ secrets.VERACODE_API_KEY }}",
+        out += [f"      uses: {actions['iac']}", "      with:", *_creds(),
                 "        command: scan", "        type: directory", "        source: ./",
                 "        format: table", f"        fail_build: {'true' if cfg['iac_blocking'] else 'false'}"]
     return out
@@ -1289,6 +1358,9 @@ def _check_keys(values: dict, where: str) -> None:
         raise ToolError(f"unknown config keys in {where}: {', '.join(sorted(unknown))}")
     if "artifact_path" in values and isinstance(values["artifact_path"], str):
         values["artifact_path"] = [values["artifact_path"]]
+    for key in ("pipeline", "policy", "sandboxes", "sca_blocking", "iac_blocking"):
+        if key in values and not isinstance(values[key], bool):
+            raise ToolError(f"{where}.{key} must be true or false")
     for key, allowed in (("sast", {"auto", "on", "off"}), ("sca", {"auto", "on", "off"}),
                          ("iac", {"on", "artifacts", "off"})):
         if key in values:
@@ -1529,14 +1601,16 @@ def commit_message(plan: Plan, removing: bool = False) -> str:
     sast = {"off": "off", "binary": "build output", "source": "source code",
             "binary+source": "build output and source code"}[plan.sast_mode]
     r = plan.reasons
-    lines.append(f"- SAST: {sast}" + (f", runs after job `{plan.needs}`" if plan.needs and plan.sast_mode != "off" else "")
-                 + ("; Pipeline Scan on branch pushes and PRs, Policy Scan on the default branch" if plan.sast_mode != "off" else ""))
+    lines.append(f"- SAST: {sast}" + (f", runs after job `{plan.needs}`" if plan.needs and plan.sast_mode != "off" else ""))
+    if plan.sast_mode != "off":
+        lines += [f"  - {SCAN_LABELS[s]}" for s in plan.sast_scans]
     if r.get("sast"):
         lines.append(f"  Why: {r['sast']}")
-    lines.append(f"- SCA: {s['sca']} (agent-based)" + (f"\n  Why: {r['sca']}" if r.get("sca") else ""))
+    lines.append(f"- SCA: {s['sca']} (agent-based, on PRs into the default branch and pushes to it)"
+                 + (f"\n  Why: {r['sca']}" if r.get("sca") else ""))
     if plan.sca_runner:
         lines.append(f"  Runner: {plan.sca_runner} ({r.get('runner', '')})")
-    lines.append(f"- IaC/Secrets: {s['iac']}" + (f"\n  Why: {r['iac']}" if r.get("iac") else ""))
+    lines.append(f"- IaC/Secrets: {s['iac']} (every run)" + (f"\n  Why: {r['iac']}" if r.get("iac") else ""))
     if plan.todos:
         lines += ["", "TODO"] + [f"- {t}" for t in plan.todos]
     if plan.notes:
@@ -1889,6 +1963,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--branch-fail-on-severity", help="severities that fail branch-push scans, e.g. 'Very High, High' (default: any flaw)")
     p.add_argument("--runner", help="runs-on for the Veracode jobs (default ubuntu-latest)")
     p.add_argument("--sast", choices=["auto", "on", "off"])
+    p.add_argument("--pipeline", action="store_true", default=None,
+                   help="Pipeline Scan on branch pushes and PRs (default with --policy when no scan flag is given)")
+    p.add_argument("--policy", action="store_true", default=None,
+                   help="Policy Scan (Upload and Scan) on pushes to the default branch")
+    p.add_argument("--sandboxes", action="store_true", default=None,
+                   help="Sandbox scan on PRs into the default branch (sandbox = PR source branch)")
     p.add_argument("--sca", choices=["auto", "on", "off"])
     p.add_argument("--iac", choices=["on", "artifacts", "off"],
                    help="on: every repo (secret scanning); artifacts: only repos with IaC/container files")
@@ -1924,6 +2004,9 @@ def main(argv: list[str] | None = None) -> int:
         "sast": args.sast, "sca": args.sca, "iac": args.iac, "windows_runner": args.windows_runner,
         "sca_blocking": args.sca_blocking, "iac_blocking": args.iac_blocking,
     }
+    # Any scan flag selects exactly the given scans.
+    if args.pipeline or args.policy or args.sandboxes:
+        cli_cfg.update({s: bool(getattr(args, s)) for s in SAST_SCANS})
     try:
         return run_targets(args, cli_cfg) if args.target else run_file(args, cli_cfg)
     except Skip as exc:
