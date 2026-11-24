@@ -33,3 +33,6 @@ repos:
   "my-org/docs-*":
     sast: "off"
     sca: "off"
+  "my-org/coldfusion-portal":          # ColdFusion: point at the WAR built by cfcompile -deploy
+    build_job: package
+    artifact_path: ["dist/*.war"]

@@ -11,18 +11,22 @@ import argparse
 import base64
 import csv
 import difflib
+import email.utils
 import fnmatch
 import hashlib
 import http.client
 import json
 import os
+import random
 import re
+import shlex
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -50,8 +54,17 @@ DOCS = {
     "java": "https://docs.veracode.com/r/compilation_java",
     "dotnet": "https://docs.veracode.com/r/compilation_net",
     "js": "https://docs.veracode.com/r/compilation_jscript",
-    "creds": "https://docs.veracode.com/r/t_create_api_creds",
-    "sca_agent": "https://docs.veracode.com/r/t_sc_cli_agent",
+    "languages": "https://docs.veracode.com/r/r_supported_table",
+    "pipeline_languages": "https://docs.veracode.com/r/Pipeline_Scan_Supported_Languages",
+    "apple": "https://docs.veracode.com/r/compilation_apple_platforms",
+    "flutter": "https://docs.veracode.com/r/Dart_and_Flutter_Application_Packaging",
+    "ruby": "https://docs.veracode.com/r/compilation_ruby",
+    "coldfusion": "https://docs.veracode.com/r/compilation_CF",
+    "cpp": "https://docs.veracode.com/r/C_Cplus_preprocessed_source_packaging",
+    "go": "https://docs.veracode.com/r/compilation_go",
+    "asp": "https://docs.veracode.com/r/compilation_ASPclassic",
+    "creds": "https://docs.veracode.com/r/c_api_credentials3",
+    "sca_agent": "https://docs.veracode.com/r/Manage_agents_and_scans",
     "tool": "https://github.com/ancient-cthulhu/Veracode-Pipeline-Inject",
 }
 
@@ -115,8 +128,45 @@ _Loader.add_implicit_resolver(
     re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"), list("tTfF"))
 
 
+MAX_YAML_NODES = 200_000  # expanded size; real workflows stay far below, alias bombs expand to billions
+
+
+def _yaml_children(n) -> list:
+    if isinstance(n, yaml.SequenceNode):
+        return n.value
+    if isinstance(n, yaml.MappingNode):
+        return [x for kv in n.value for x in kv]
+    return []
+
+
+def _check_alias_expansion(text: str) -> None:
+    """Reject YAML whose aliases expand past MAX_YAML_NODES (a 600-byte file can expand to billions)."""
+    root = yaml.compose(text, Loader=_Loader)  # aliases stay shared nodes here, so this is cheap
+    size: dict[int, int] = {}
+    stack = [(root, False)] if root is not None else []
+    while stack:
+        n, done = stack.pop()
+        if id(n) in size:
+            continue
+        kids = _yaml_children(n)
+        if done:
+            total = 1 + sum(size.get(id(c), 1) for c in kids)
+            if total > MAX_YAML_NODES:
+                raise ToolError("YAML aliases expand to too many nodes (alias bomb?); not processed")
+            size[id(n)] = total
+        else:
+            stack.append((n, True))
+            stack.extend((c, False) for c in kids if id(c) not in size)
+
+
+# A YAML anchor (`&name` after a space, `[`, `{` or `,`); shell `&&`, `&>` and ` & ` don't match.
+_ANCHOR_RE = re.compile(r"(?:^|[\s\[{,])&[^\s&>\[\]{},]", re.M)
+
+
 def load_yaml(text: str):
-    return yaml.load(text, Loader=_Loader)
+    if _ANCHOR_RE.search(text):
+        _check_alias_expansion(text)
+    return yaml.load(text, Loader=_Loader)  # noqa: S506  # nosec B506 - _Loader is a SafeLoader subclass
 
 
 class _PosLoader(_Loader):
@@ -229,39 +279,66 @@ def wrap_block(body: list[str], indent: int, eol: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 MIN_LANGUAGE_BYTES = 200
-SAST_LANGUAGES = {
-    "C#", "F#", "Visual Basic .NET", "ASP.NET", "Go", "Java", "Groovy", "JavaScript", "TypeScript",
-    "Vue", "JSX", "Svelte", "Kotlin", "PHP", "Python", "Ruby", "Scala", "Apex", "ColdFusion", "C", "C++",
+# Veracode Static Analysis languages: https://docs.veracode.com/r/r_supported_table
+# Pipeline Scan supports a subset: https://docs.veracode.com/r/Pipeline_Scan_Supported_Languages
+# Language -> build family whose output the scan needs (https://docs.veracode.com/r/compilation_packaging).
+BUILD_LANGS = {
+    "Java": "jvm", "Kotlin": "jvm", "Scala": "jvm", "Groovy": "jvm",
+    "C#": "dotnet", "Visual Basic .NET": "dotnet", "ASP.NET": "dotnet",
+    "C": "native", "C++": "native", "Swift": "apple", "Objective-C": "apple",
+    "Dart": "flutter", "Ruby": "rails", "ColdFusion": "coldfusion",
 }
-COMPILED_LANGS = {"Java", "Kotlin", "Scala", "Groovy", "C#", "F#", "Visual Basic .NET", "ASP.NET", "C", "C++"}
-SOURCE_LANGS = SAST_LANGUAGES - COMPILED_LANGS
-# Languages found but not scanned by this tool, with the reason shown in the plan.
+# Scanned from a source archive.
+SOURCE_SAST = {"JavaScript", "TypeScript", "Vue", "JSX", "Python", "PHP", "Go", "Apex", "COBOL",
+               "Perl", "PLSQL", "TSQL", "Classic ASP", "Visual Basic 6.0", "RPG"}
+SAST_LANGUAGES = set(BUILD_LANGS) | SOURCE_SAST
+COMPILED_LANGS = set(BUILD_LANGS)
+SOURCE_LANGS = SOURCE_SAST
+# Static Analysis only (not in the Pipeline Scan list).
+POLICY_ONLY = {"Dart", "Perl", "PLSQL", "TSQL", "Classic ASP", "Visual Basic 6.0", "RPG"}
+# Source languages strong enough to add a source archive next to binaries (rarely build tooling).
+STANDALONE_SOURCE = {"Apex", "COBOL", "PLSQL", "TSQL", "Classic ASP", "Visual Basic 6.0", "RPG"}
+# Languages found but never scanned, with the reason shown in the plan.
 SAST_TIERS = [
-    ("needs a macOS/Xcode build", {"Swift", "Objective-C"}),
-    ("no build output this tool can package", {"COBOL"}),
-    ("no Pipeline Scan support", {"Perl", "PLSQL", "PL/SQL", "TSQL", "Classic ASP", "RPG",
-                                  "Visual Basic 6.0", "VBA", "Dart"}),
+    ("not supported by Veracode SAST", {"F#", "Svelte", "CoffeeScript", "VBA", "Rust", "Elixir"}),
 ]
 SAST_BUILD_EVIDENCE = {
     lang: ({"makefile", "gnumakefile", "cmakelists.txt", "meson.build", "build.ninja", "configure.ac",
             "configure", "sconstruct"}, (".vcxproj", ".vcproj", ".mk", ".bb"))
     for lang in ("C", "C++")
 }
-LANGUAGE_ALIASES = {"TSX": "TypeScript", "Objective-C++": "Objective-C",
-                    "ColdFusion CFC": "ColdFusion", "Java Server Pages": "Java"}
+LANGUAGE_ALIASES = {"TSX": "TypeScript", "Objective-C++": "Objective-C", "ColdFusion CFC": "ColdFusion",
+                    "Java Server Pages": "Java", "RPGLE": "RPG", "Groovy Server Pages": "Groovy"}
 CODE_EXTENSIONS = {
     ".cs": "C#", ".cshtml": "C#", ".razor": "C#", ".fs": "F#", ".vb": "Visual Basic .NET",
     ".go": "Go", ".java": "Java", ".jsp": "Java", ".groovy": "Groovy",
     ".js": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript", ".jsx": "JavaScript",
     ".ts": "TypeScript", ".tsx": "TypeScript", ".mts": "TypeScript", ".cts": "TypeScript",
-    ".vue": "Vue", ".svelte": "Svelte", ".kt": "Kotlin", ".kts": "Kotlin", ".py": "Python",
-    ".rb": "Ruby", ".erb": "Ruby", ".scala": "Scala", ".php": "PHP", ".dart": "Dart",
-    ".pl": "Perl", ".pm": "Perl", ".cfm": "ColdFusion", ".cfc": "ColdFusion",
-    ".cls": "Apex", ".trigger": "Apex", ".c": "C", ".cpp": "C++", ".cc": "C++", ".cxx": "C++",
-    ".hpp": "C++", ".hh": "C++", ".h": "C", ".swift": "Swift", ".m": "Objective-C",
-    ".mm": "Objective-C", ".cbl": "COBOL", ".cob": "COBOL", ".rs": "Rust", ".ex": "Elixir",
-    ".exs": "Elixir",
+    ".vue": "Vue", ".svelte": "Svelte", ".coffee": "CoffeeScript", ".kt": "Kotlin", ".kts": "Kotlin",
+    ".py": "Python", ".rb": "Ruby", ".erb": "Ruby", ".scala": "Scala", ".php": "PHP", ".dart": "Dart",
+    ".pl": "Perl", ".pm": "Perl", ".plx": "Perl", ".pl5": "Perl",
+    ".cfm": "ColdFusion", ".cfml": "ColdFusion", ".cfc": "ColdFusion",
+    ".cls": "Apex", ".trigger": "Apex", ".tgr": "Apex", ".page": "Apex", ".component": "Apex",
+    ".cmp": "Apex", ".evt": "Apex", ".vfp": "Apex",
+    ".c": "C", ".cpp": "C++", ".cc": "C++", ".cxx": "C++", ".hpp": "C++", ".hh": "C++", ".h": "C",
+    ".swift": "Swift", ".m": "Objective-C", ".mm": "Objective-C",
+    ".cbl": "COBOL", ".cob": "COBOL", ".cobol": "COBOL", ".pco": "COBOL",
+    ".pkb": "PLSQL", ".pks": "PLSQL", ".pck": "PLSQL", ".pls": "PLSQL", ".prc": "PLSQL", ".fnc": "PLSQL",
+    ".tpb": "PLSQL", ".tps": "PLSQL",
+    ".asp": "Classic ASP", ".asa": "Classic ASP",
+    ".bas": "Visual Basic 6.0", ".frm": "Visual Basic 6.0", ".ctl": "Visual Basic 6.0",
+    ".vbp": "Visual Basic 6.0", ".vbg": "Visual Basic 6.0",
+    ".rpg": "RPG", ".rpg4": "RPG", ".rpgle": "RPG",
+    ".rs": "Rust", ".ex": "Elixir", ".exs": "Elixir",
 }
+APEX_EXTENSIONS = (".cls", ".trigger", ".tgr", ".page", ".component", ".cmp", ".evt", ".vfp")
+VB6_EXTENSIONS = (".bas", ".frm", ".ctl", ".vbp", ".vbg")
+PLSQL_EXTENSIONS = (".pkb", ".pks", ".pck", ".pls", ".prc", ".fnc", ".tpb", ".tps")
+PLSQL_PACKAGES = (".pkb", ".pks", ".pck")  # unambiguous; .pls/.prc/.fnc are also playlists etc.
+# Classic ASP gets its own upload (not with DLL/EXE or other languages).
+ASP_GLOBS = ["**/*.asp", "**/*.asa"]
+# Go: one module per upload, packaged separately (https://docs.veracode.com/r/compilation_go).
+GO_GLOBS = ["**/*.go", "**/go.mod", "**/go.sum"]
 # Agent-based SCA support: https://docs.veracode.com/r/Agent_Based_Scans (Supported languages).
 SCA_LANGUAGES = {"C#", "F#", "Visual Basic .NET", "ASP.NET", "Go", "Java", "Groovy", "JavaScript",
                  "TypeScript", "Vue", "JSX", "Svelte", "Kotlin", "PHP", "Python", "Scala", "Ruby",
@@ -318,7 +395,7 @@ MAKE_CLEAN_RE = re.compile(r"^clean\s*:", re.M)
 MAKE_APPLE_RE = re.compile(r"\b(?:xcodebuild|xcrun|notarytool)\b")  # macOS-only build; the agent's make runs on Linux
 # Manifests that show a first-party source-language project (not vendored static JS).
 SOURCE_PROJECT_NAMES = {"package.json", "requirements.txt", "pyproject.toml", "setup.py", "pipfile",
-                        "go.mod", "composer.json", "gemfile"}
+                        "go.mod", "composer.json"}
 IAC_FILE_NAMES = {
     "dockerfile", "containerfile", ".dockerignore", "docker-compose.yml", "docker-compose.yaml",
     "compose.yml", "compose.yaml", "chart.yaml", "values.yaml", "kustomization.yaml",
@@ -363,7 +440,12 @@ TOOLING_BASENAMES = {
     "webpack.mix.js", "jest.setup.js", "protractor.conf.js", "karma.conf.js", "gulpfile.js",
     "gruntfile.js", ".eslintrc.js", ".eslintrc.cjs", "build.gradle.kts", "settings.gradle.kts",
 } | {f"{s}{e}" for s in _TOOLING_STEMS for e in (".js", ".cjs", ".mjs", ".ts", ".mts", ".cts")}
-FRAMEWORK_PLATFORM_DIRS = {"pubspec.yaml": ("android", "ios", "linux", "macos", "windows", "web")}
+FRAMEWORK_PLATFORM_DIRS = {
+    "pubspec.yaml": ("android", "ios", "linux", "macos", "windows", "web"),       # Flutter
+    "metro.config.js": ("android", "ios"), "metro.config.cjs": ("android", "ios"),  # React Native
+    "capacitor.config.json": ("android", "ios"), "capacitor.config.ts": ("android", "ios"),
+    "ionic.config.json": ("android", "ios", "platforms"),
+}
 APPLE_CORROBORATION = ({"podfile", "podfile.lock", "info.plist", "cartfile", "package.swift"},
                        (".pbxproj", ".xcworkspacedata", ".xcscheme", ".swift", ".xcconfig"))
 SALESFORCE_CORROBORATION = ({"sfdx-project.json"}, {"force-app", "classes", "triggers", "aura", "lwc"})
@@ -382,6 +464,7 @@ class Detection:
     windows: str | None = None     # evidence for a Windows SCA runner
     runner_reason: str = ""
     source_projects: list = field(default_factory=list)
+    go_modules: list = field(default_factory=list)   # dirs holding go.mod ("" = repo root)
     truncated: bool = False
 
     @property
@@ -480,6 +563,8 @@ def detect(paths: list[str], linguist: dict | None = None, truncated: bool = Fal
         seg in SALESFORCE_CORROBORATION[1] for _, lp, _ in entries for seg in lp.split("/")[:-1])
     c_ok = any(b.endswith((".c", ".cpp", ".cc", ".cxx")) or b in ("makefile", "gnumakefile", "cmakelists.txt")
                for b in bases)
+    vb6_ok = any(b.endswith((".vbp", ".vbg")) for b in bases)
+    plsql_ok = any(b.endswith(PLSQL_PACKAGES) for b in bases)
     ext_bytes: dict[str, int] = {}
     unknown = set()
     for p, lp, base in class_entries:
@@ -487,8 +572,11 @@ def detect(paths: list[str], linguist: dict | None = None, truncated: bool = Fal
             continue
         lang = _ext_language(base)
         ext = base[base.rfind("."):] if lang else ""
-        if not lang or (ext == ".m" and not apple_ok) or (ext in (".cls", ".trigger") and not sf_ok) \
-                or (ext == ".h" and not c_ok):
+        if ext == ".cls" and not sf_ok:
+            lang = "Visual Basic 6.0" if vb6_ok else None
+        if not lang or (ext == ".m" and not apple_ok) or (ext in APEX_EXTENSIONS and lang == "Apex" and not sf_ok) \
+                or (ext == ".h" and not c_ok) or (ext in VB6_EXTENSIONS and not vb6_ok) \
+                or (ext in PLSQL_EXTENSIONS and not plsql_ok):
             continue
         size = sizes.get(p)
         if size is None:
@@ -506,15 +594,34 @@ def detect(paths: list[str], linguist: dict | None = None, truncated: bool = Fal
     sast = langs & SAST_LANGUAGES
     evidence = {lp.rsplit("/", 1)[-1] for lp in lower if not (fw and lp.startswith(fw))}
     no_build = set()
+    # Veracode scans these only in specific project shapes; anything else is named, not scanned.
+    shape: dict[str, str] = {}
     if not truncated:
         for lang, (names, suffixes) in SAST_BUILD_EVIDENCE.items():
             if lang in sast and not any(b in names or b.endswith(suffixes) for b in evidence):
                 no_build.add(lang)
-    det.sast_langs = sast - no_build
+        mobile_dirs = tuple(d for d in fw if d.endswith(("/android/", "/ios/")) or d in ("android/", "ios/"))
+        checks = {
+            "Swift": (any(b.endswith((".pbxproj", ".xcworkspacedata")) for b in bases),
+                      "no Xcode project; Veracode scans Apple platform apps"),
+            "Objective-C": (any(b.endswith((".pbxproj", ".xcworkspacedata")) for b in bases),
+                            "no Xcode project; Veracode scans Apple platform apps"),
+            "Dart": ("pubspec.yaml" in evidence and any(lp.startswith(mobile_dirs) for lp in lower),
+                     "not a Flutter mobile app; Veracode scans Flutter APK/IPA builds"),
+            "Ruby": (any(lp == "config/application.rb" or lp.endswith("/config/application.rb") for lp in lower),
+                     "not a Rails app; Veracode scans Ruby on Rails only"),
+            "PLSQL": (plsql_ok, "no .pkb/.pks/.pck package files; set sast: on to scan it"),
+            "TSQL": (any(b.endswith(".sqlproj") for b in bases), "no .sqlproj; set sast: on to scan it"),
+            "Visual Basic 6.0": (vb6_ok, "no .vbp/.vbg project"),
+        }
+        shape = {lang: why for lang, (ok, why) in checks.items() if lang in sast and not ok}
+    det.sast_langs = sast - no_build - set(shape)
     not_counted = [f"{l} ({why})" for why, members in SAST_TIERS for l in sorted(langs & members)]
+    not_counted += [f"{l} ({why})" for l, why in sorted(shape.items())]
     not_counted += [f"{l} (no Makefile/CMake/vcxproj)" for l in sorted(no_build)]
     if det.sast_langs:
-        det.sast_reason = f"languages: {', '.join(sorted(det.sast_langs))}"
+        det.sast_reason = "languages: " + ", ".join(
+            f"{l} (Policy Scan only)" if l in POLICY_ONLY else l for l in sorted(det.sast_langs))
         if not_counted:
             det.sast_reason += f"; not scanned: {', '.join(not_counted[:6])}"
     elif truncated:
@@ -523,7 +630,7 @@ def detect(paths: list[str], linguist: dict | None = None, truncated: bool = Fal
         det.sast_reason = f"off: {', '.join(not_counted[:6])}"
     else:
         found = sorted(langs)[:8]
-        det.sast_reason = "off: no Pipeline Scan language" + (f" (found {', '.join(found)})" if found else "")
+        det.sast_reason = "off: no language Veracode SAST supports" + (f" (found {', '.join(found)})" if found else "")
     if not det.sast_langs and small:
         det.sast_reason += "; below " + str(MIN_LANGUAGE_BYTES) + " bytes (stub): " + \
             ", ".join(f"{l} {b} B" for l, b in sorted(small.items()))
@@ -567,6 +674,12 @@ def detect(paths: list[str], linguist: dict | None = None, truncated: bool = Fal
                 det.sca_make = mk
             else:
                 make_reason = f"{mk} has no gcc/g++/clang/CMake build or no clean target, which the agent needs"
+    mods = []
+    for p, lp, base in entries:
+        segs = lp.split("/")[:-1]
+        if base == "go.mod" and not any(s in ("testdata",) or s.startswith(("_", ".")) for s in segs):
+            mods.append("/".join(p.replace("\\", "/").split("/")[:-1]))
+    det.go_modules = sorted(mods, key=lambda d: (d.count("/") + bool(d), d))
     det.sca = bool(enabling) or truncated
     if enabling:
         det.sca_reason = f"manifests: {', '.join(sorted(enabling)[:5])} ({', '.join(sorted(ecos))})"
@@ -646,6 +759,10 @@ BINARY_TOOLS = [
     ("gradle", re.compile(r"(?:^|[\s/])gradlew?(?:\.bat)?\b[^\n]*?\b(?:build|assemble\w*|jar|war|bootJar|bootWar|shadowJar)\b")),
     ("sbt", re.compile(r"(?:^\s*|[;&|]\s*)sbt\b[^\n]*?\b(?:package|assembly|universal:packageBin)\b", re.M)),
     ("ant", re.compile(r"(?:^\s*|[;&|]\s*)ant(?:\s|$)", re.M)),
+    ("grails", re.compile(r"(?:^|[\s/])grailsw?\b[^\n]*?\b(?:assemble|war|package)\b")),
+    ("flutter", re.compile(r"\bflutter\s+build\s+(?:apk|appbundle|ipa)\b")),
+    ("xcode", re.compile(r"\bxcodebuild\b[^\n]*\barchive\b")),
+    ("rails", re.compile(r"\bveracode\s+prepare\b")),
     ("dotnet-publish", re.compile(r"\bdotnet\s+publish\b")),
     ("dotnet", re.compile(r"\bdotnet\s+build\b|\bmsbuild(?:\.exe)?\b")),
     ("native", re.compile(r"(?:^\s*|[;&|]\s*)(?:make|cmake\s+--build|ninja)(?:\s|$)", re.M)),
@@ -655,22 +772,46 @@ ANCHOR_RE = re.compile(
     r"|\bpoetry\s+(?:install|build)\b|\buv\s+(?:sync|build)\b|\btox\b|\bnox\b"
     r"|\bgo\s+(?:build|test|vet)\b|\bcomposer\s+install\b|\bbundle\s+(?:install|exec)\b"
     r"|\bpython3?\s+-m\s+(?:build|pytest|pip)\b|\bmvnw?\b|\bgradlew?\b|\bdotnet\s+\w+|\bmsbuild\b|\bmake\b"
-    r"|\bsbt\b|\bant\b")
+    r"|\bsbt\b|\bant\b|\bflutter\s+(?:test|build|pub)\b|\bxcodebuild\b|\bgrailsw?\b")
 BINARY_PATHS = {
     "maven": ["**/target/*.jar", "**/target/*.war", "**/target/*.ear",
               "!**/target/*-sources.jar", "!**/target/*-javadoc.jar", "!**/target/*-tests.jar"],
     "gradle": ["**/build/libs/*.jar", "**/build/libs/*.war", "**/build/outputs/apk/**/*.apk",
+               "**/build/outputs/bundle/**/*.aab",
                "!**/build/libs/*-sources.jar", "!**/build/libs/*-javadoc.jar",
                "!**/build/libs/*-plain.jar"],
+    "grails": ["**/build/libs/*.war", "**/build/libs/*.jar", "!**/build/libs/*-plain.jar",
+               "!**/build/libs/*-sources.jar", "!**/build/libs/*-javadoc.jar"],
+    "flutter": ["**/build/app/outputs/flutter-apk/*.apk", "**/build/ios/ipa/*.ipa"],
+    "xcode": ["**/*.xcarchive/**"],
+    "rails": ["**/tmp/veracode-*.zip"],
     "dotnet": ["**/bin/**/*.dll", "**/bin/**/*.exe", "**/bin/**/*.pdb"],
     "dotnet-publish": ["**/bin/**/publish/**/*.dll", "**/bin/**/publish/**/*.exe",
                        "**/bin/**/publish/**/*.pdb"],
-    "sbt": ["**/target/scala-*/*.jar", "!**/target/scala-*/*-sources.jar", "!**/target/scala-*/*-javadoc.jar"],
+    "sbt": ["**/target/scala-*/*.jar", "!**/target/scala-*/*-sources.jar", "!**/target/scala-*/*-javadoc.jar",
+            "!**/target/scala-*/*-sans-externalized.jar"],
     "ant": ["**/dist/**/*.jar", "**/dist/**/*.war", "**/dist/**/*.ear"],
     "native": [],
 }
 TOOL_LABEL = {"maven": "Maven", "gradle": "Gradle", "sbt": "sbt", "ant": "Ant", "dotnet": ".NET build",
-              "dotnet-publish": ".NET publish", "native": "native build"}
+              "dotnet-publish": ".NET publish", "native": "native build", "grails": "Grails",
+              "flutter": "Flutter", "xcode": "Xcode archive", "rails": "Veracode RubyGem"}
+TOOL_FAMILY = {"maven": "jvm", "gradle": "jvm", "sbt": "jvm", "ant": "jvm", "grails": "jvm",
+               "dotnet": "dotnet", "dotnet-publish": "dotnet", "native": "native", "xcode": "apple",
+               "flutter": "flutter", "rails": "rails"}
+# What each build family needs, for TODOs.
+FAMILY_HINT = {
+    "jvm": ("a Maven, Gradle, sbt, Ant or Grails build (JAR/WAR/EAR, compiled with debug info)", "java"),
+    "dotnet": ("dotnet build/publish or msbuild, with .pdb files", "dotnet"),
+    "native": ("a make/CMake build with debug symbols; set artifact_path to the binaries, or to .i/.ii "
+               "preprocessed files plus veracode.json", "cpp"),
+    "apple": ("a macOS job: xcodebuild archive (Debug, DEBUG_INFORMATION_FORMAT=dwarf-with-dsym), then gen-ir",
+              "apple"),
+    "flutter": ("`flutter build apk --debug`", "flutter"),
+    "rails": ("the Veracode RubyGem: `veracode prepare` in a job where the Rails app can boot "
+              "(writes tmp/veracode-*.zip)", "ruby"),
+    "coldfusion": ("cfcompile -deploy, packaged as a WAR; set artifact_path to the WAR", "coldfusion"),
+}
 PREFERRED_JOB_RE = re.compile(r"build|package|compile|^ci$", re.I)
 TEST_JOB_RE = re.compile(r"test|check|verify", re.I)
 PREFERRED_WF = ("ci", "build", "main", "pipeline", "build-and-test", "maven", "gradle", "dotnet",
@@ -823,9 +964,12 @@ def _rank_jobs(wf: Workflow, job_ids: list[str]) -> list[str]:
     return [j for j in ranked if _job_key(wf, j) == _job_key(wf, ranked[0])] if ranked else []
 
 
-def choose_build(wf: Workflow, cfg: dict) -> tuple[BuildMatch | None, list[str]]:
-    """Return (build, other equally ranked job ids). The first job in file order wins ties."""
+def choose_build(wf: Workflow, cfg: dict, families: set | None = None) -> tuple[BuildMatch | None, list[str]]:
+    """Return (build, other equally ranked job ids). The first job in file order wins ties.
+    families: build families of the languages found; builds for them win over other builds."""
     matches = [m for m in find_builds(wf) if m.job not in JOB_IDS]
+    if families and not cfg.get("build_job"):
+        matches = [m for m in matches if TOOL_FAMILY.get(m.tool) in families] or matches
     if cfg.get("build_job"):
         job = cfg["build_job"]
         if job not in wf.jobs:
@@ -890,6 +1034,10 @@ class Plan:
     sca_runner: str | None = None   # set when the SCA job needs another runner (Windows)
     reasons: dict = field(default_factory=dict)
     sast_scans: list = field(default_factory=list)
+    source_zip: bool = False         # zip the repo source (git archive)
+    source_excludes: list = field(default_factory=list)
+    go_modules: list = field(default_factory=list)   # Go module dirs to package (one; "" = root)
+    go_skip: list = field(default_factory=list)      # other module dirs, removed from that package
     todos: list = field(default_factory=list)
     notes: list = field(default_factory=list)
 
@@ -946,6 +1094,9 @@ def scan_decisions(det: Detection, cfg: dict) -> dict:
         out["sast"] = (False, "off: no SAST scan selected (pipeline, policy)")
     elif cfg["sast"] == "on" and not det.sast:
         out["sast"] = (True, f"forced on by config ({det.sast_reason})")
+    elif det.sast_langs and det.sast_langs <= POLICY_ONLY and selected_scans(cfg) == ["pipeline"]:
+        out["sast"] = (False, f"off: Pipeline Scan doesn't support {', '.join(sorted(det.sast_langs))}; "
+                              "they need the Policy Scan (policy)")
     else:
         out["sast"] = (det.sast, det.sast_reason)
     if cfg["sca"] == "off":
@@ -961,6 +1112,23 @@ def scan_decisions(det: Detection, cfg: dict) -> dict:
     else:
         out["runner"] = (None, det.runner_reason)
     return out
+
+
+def _build_todos(wf: Workflow, build: BuildMatch, plan: Plan) -> None:
+    """Packaging requirements the build step itself must meet."""
+    steps = wf.steps(build.job)
+    text = step_text(steps[build.step]) if build.step < len(steps) else ""
+    if build.tool == "flutter":
+        if "appbundle" in text:
+            plan.todos.append(f"Veracode scans Flutter APK/IPA builds, not app bundles: `flutter build apk --debug` "
+                              f"({DOCS['flutter']})")
+        elif "--debug" not in text:
+            plan.todos.append(f"Veracode needs a debug Flutter build: `flutter build apk --debug` ({DOCS['flutter']})")
+    elif build.tool == "xcode" and not any("gen-ir" in step_text(s) for s in steps):
+        plan.todos.append("Run gen-ir on the build log and the archive after `xcodebuild archive` (Debug, "
+                          f"DEBUG_INFORMATION_FORMAT=dwarf-with-dsym) in job `{build.job}` ({DOCS['apple']})")
+    elif build.tool == "rails":
+        plan.notes.append("Veracode RubyGem: config.cache_classes and config.eager_load must be false")
 
 
 def make_plan(wf: Workflow, det: Detection, cfg: dict) -> Plan:
@@ -992,10 +1160,19 @@ def make_plan(wf: Workflow, det: Detection, cfg: dict) -> Plan:
 
     if not dec["sast"][0]:
         return plan
+    scanned = set(det.sast_langs)
+    asp_alone = False
+    if "Classic ASP" in scanned and len(scanned) > 1:
+        scanned.discard("Classic ASP")
+        asp_alone = True
+        plan.todos.append("Classic ASP is left out of this scan: Veracode advises against uploading it with other "
+                          "languages (results are delayed) or with DLL/EXE files. Scan it in its own application "
+                          f"profile ({DOCS['asp']})")
     want_compiled = bool(det.compiled) or cfg["sast"] == "on" or (det.truncated and not det.sast_langs)
-    want_source = bool(det.source)
+    want_source = bool(scanned & SOURCE_LANGS)
+    families = {BUILD_LANGS[lang] for lang in det.compiled}
 
-    build, others = choose_build(wf, cfg)
+    build, others = choose_build(wf, cfg, families)
     if others and (want_compiled or cfg.get("build_job")):
         if cfg.get("strict"):
             raise Skip(f"several jobs build the code ({', '.join([build.job, *others])}); "
@@ -1006,7 +1183,17 @@ def make_plan(wf: Workflow, det: Detection, cfg: dict) -> Plan:
         plan.build = build
         plan.needs = build.job
         # Binaries cover the compiled code; add source only for a real JS/Python/... project.
-        plan.sast_mode = "binary+source" if want_source and det.source_projects else "binary"
+        extra_source = det.source_projects or (scanned & STANDALONE_SOURCE)
+        plan.sast_mode = "binary+source" if want_source and extra_source else "binary"
+        covered = TOOL_FAMILY.get(build.tool)
+        missing = sorted(lang for lang in det.compiled if BUILD_LANGS[lang] != covered)
+        if missing and covered and not cfg.get("artifact_path"):
+            for fam in sorted({BUILD_LANGS[lang] for lang in missing}):
+                langs_ = ", ".join(lang for lang in missing if BUILD_LANGS[lang] == fam)
+                hint, doc = FAMILY_HINT[fam]
+                plan.todos.append(f"SAST for {langs_} needs {hint}; the `{build.job}` build doesn't produce it "
+                                  f"({DOCS[doc]})")
+        _build_todos(wf, build, plan)
         reuse = None if cfg.get("artifact_path") else existing_upload(wf, build)
         if reuse:
             plan.reuse = reuse
@@ -1027,11 +1214,46 @@ def make_plan(wf: Workflow, det: Detection, cfg: dict) -> Plan:
     elif det.compiled:
         if want_source:
             plan.sast_mode = "source"
-        plan.todos.append(f"SAST for {', '.join(sorted(det.compiled))} needs a build step "
-                          "(Maven, Gradle, dotnet, msbuild or make) in this workflow. Re-run with "
-                          f"--build-job/--artifact-path. Packaging guide: {DOCS['packaging']}")
+        for fam in sorted(families):
+            langs_ = ", ".join(sorted(lang for lang in det.compiled if BUILD_LANGS[lang] == fam))
+            hint, doc = FAMILY_HINT[fam]
+            plan.todos.append(f"SAST for {langs_} needs {hint} in this workflow. Re-run with "
+                              f"--build-job/--artifact-path ({DOCS[doc]})")
     elif want_source:
         plan.sast_mode = "source"
+
+    if "source" in plan.sast_mode:
+        src = scanned & SOURCE_LANGS
+        if "Go" in src and det.go_modules:
+            plan.go_modules, plan.go_skip = det.go_modules[:1], det.go_modules[1:]
+            if plan.go_skip:
+                shown = ", ".join(plan.go_skip[:5]) + (f" and {len(plan.go_skip) - 5} more" if len(plan.go_skip) > 5 else "")
+                plan.todos.append(f"{len(det.go_modules)} Go modules; only `{plan.go_modules[0] or '.'}` is scanned "
+                                  "(Veracode takes one Go module per upload). Scan the others in their own "
+                                  f"application profiles: {shown} ({DOCS['go']})")
+        plan.source_excludes = (ASP_GLOBS if asp_alone else []) + (GO_GLOBS if plan.go_modules else [])
+        plan.source_zip = bool(src - {"Go"}) or not plan.go_modules
+
+    # What this scan actually covers decides Pipeline Scan vs Policy Scan only.
+    included = set()
+    if plan.sast_mode.startswith("binary") and plan.build:
+        fam = TOOL_FAMILY.get(plan.build.tool)
+        included |= {lang for lang in det.compiled if BUILD_LANGS[lang] == fam or not fam}
+    if "source" in plan.sast_mode:
+        included |= scanned & SOURCE_LANGS
+    policy_only = sorted(included & POLICY_ONLY)
+    if policy_only and "pipeline" in plan.sast_scans:
+        if set(policy_only) == included:
+            plan.sast_scans = [s for s in plan.sast_scans if s != "pipeline"]
+            plan.notes.append(f"Pipeline Scan doesn't support {', '.join(policy_only)}; only the Policy Scan is added")
+        else:
+            plan.notes.append(f"Pipeline Scan skips {', '.join(policy_only)}; the Policy Scan covers it")
+    if plan.sast_mode != "off" and not plan.sast_scans:
+        plan.sast_mode = "off"
+        plan.todos.append(f"SAST is off: {', '.join(policy_only)} need the Policy Scan (--policy)")
+    if plan.sast_mode == "binary" and scanned & SOURCE_LANGS - included:
+        plan.notes.append(f"Not in the scan: {', '.join(sorted(scanned & SOURCE_LANGS - included))} (no project "
+                          "files next to the binary build, so treated as build scripts)")
 
     if plan.sast_mode == "source":
         anchors = anchor_jobs(wf)
@@ -1046,33 +1268,62 @@ def make_plan(wf: Workflow, det: Detection, cfg: dict) -> Plan:
 # Rendering
 # --------------------------------------------------------------------------- #
 
-PREPARE_SCRIPT = r'''import json, os, pathlib, shutil, subprocess, zipfile
+PREPARE_SCRIPT = r'''import io, json, os, pathlib, re, shutil, subprocess, tarfile, zipfile
 DOCS = "https://docs.veracode.com/r/"
 build, out = pathlib.Path("veracode-build"), pathlib.Path("veracode-units")
 out.mkdir(exist_ok=True)
 def warn(msg, page="compilation_packaging"):
     print(f"::warning title=Veracode packaging::{msg} See {DOCS}{page}")
 files = sorted(p for p in build.rglob("*") if p.is_file()) if build.is_dir() else []
-JAVA = (".jar", ".war", ".ear", ".apk", ".aab")
+JAVA = (".jar", ".war", ".ear", ".apk", ".aab", ".ipa")
+ARCHIVES = (".zip",)  # prebuilt packages, e.g. the Veracode RubyGem output
 NATIVE = (".dll", ".exe", ".pdb", ".so", ".dylib")
-SKIP = ("-sources.jar", "-javadoc.jar", "-tests.jar", "-plain.jar")
+PRE = (".i", ".ii")
+SKIP = ("-sources.jar", "-javadoc.jar", "-tests.jar", "-plain.jar", "-sans-externalized.jar")
 units = []
-def add(src):
-    dest, n = out / src.name, 1
+def dest_for(name):
+    dest, n = out / name, 1
+    stem, suffix = (name[:-7], ".tar.gz") if name.lower().endswith(".tar.gz") else (pathlib.Path(name).stem, pathlib.Path(name).suffix)
     while dest.exists():
-        dest, n = out / f"{src.stem}-{n}{src.suffix}", n + 1
+        dest, n = out / f"{stem}-{n}{suffix}", n + 1
+    return dest
+def add(src):
+    dest = dest_for(src.name)
     shutil.copyfile(src, dest)
     units.append(dest.name)
+def zip_tree(dest, members, root, prefix=""):
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in members:
+            z.write(p, str(pathlib.PurePosixPath(prefix, p.relative_to(root).as_posix())) if prefix else p.relative_to(root))
+    units.append(dest.name)
+# Apple: each .xcarchive folder becomes one zip with the folder at its root.
+xcarchives, rest = {}, []
 for p in files:
-    if p.name.lower().endswith(JAVA) and not p.name.lower().endswith(SKIP):
+    parts = p.relative_to(build).parts
+    i = next((k for k, s in enumerate(parts[:-1]) if s.endswith(".xcarchive")), None)
+    if i is None:
+        rest.append(p)
+    else:
+        xcarchives.setdefault(build.joinpath(*parts[:i + 1]), []).append(p)
+for root, members in sorted(xcarchives.items()):
+    zip_tree(dest_for(root.name[:-len(".xcarchive")] + ".zip"), members, root, root.name)
+    if not any("dSYMs" in p.parts for p in members):
+        warn(f"{root.name} has no dSYMs. Archive a Debug build with DEBUG_INFORMATION_FORMAT=dwarf-with-dsym and run gen-ir.", "compilation_apple_platforms")
+files = rest
+for p in files:
+    n = p.name.lower()
+    if (n.endswith(JAVA) and not n.endswith(SKIP)) or n.endswith(ARCHIVES):
         add(p)
+# C/C++ preprocessed source: .i/.ii files plus veracode.json, directories kept.
+pre = [p for p in files if p.suffix.lower() in PRE or p.name.lower() == "veracode.json"]
+if any(p.suffix.lower() in PRE for p in pre):
+    zip_tree(dest_for("veracode-cpp-preprocessed.zip"), pre, build)
+    if not any(p.name.lower() == "veracode.json" for p in pre):
+        warn("Preprocessed .i/.ii files without veracode.json. Each directory with them needs a veracode.json describing the compiler.", "C_Cplus_preprocessed_source_packaging")
 native = [p for p in files if p.suffix.lower() in NATIVE]
 if native:
-    with zipfile.ZipFile(out / "veracode-binaries.zip", "w", zipfile.ZIP_DEFLATED) as z:
-        for p in files:
-            if not p.name.lower().endswith(JAVA):
-                z.write(p, p.relative_to(build))
-    units.append("veracode-binaries.zip")
+    packaged = JAVA + ARCHIVES + PRE
+    zip_tree(dest_for("veracode-binaries.zip"), [p for p in files if not p.name.lower().endswith(packaged) and p.name.lower() != "veracode.json"], build)
     bins = [p for p in native if p.suffix.lower() in (".dll", ".exe")]
     if bins and not any(p.suffix.lower() == ".pdb" for p in native):
         warn("No .pdb files next to the .dll/.exe files. Build with debug symbols (portable PDBs) so findings show file and line.", "compilation_net")
@@ -1080,15 +1331,54 @@ if native:
     if tests:
         warn(f"Test assemblies in the build output ({', '.join(tests[:5])}). Exclude test projects from the upload path.", "compilation_net")
 if os.environ.get("SOURCE_ZIP") == "true":
-    subprocess.run(["git", "archive", "--format=zip", "-o", str(out / "veracode-source.zip"), "HEAD"], check=True)
-    units.append("veracode-source.zip")
-    with zipfile.ZipFile(out / "veracode-source.zip") as z:
-        names = z.namelist()
-    if any("node_modules/" in n for n in names):
-        warn("node_modules is committed to the repository. Remove it from the scanned source.", "compilation_jscript")
-    js = [n for n in names if n.endswith(".js")]
-    if js and all(n.endswith(".min.js") for n in js):
-        warn("Only minified JavaScript found. Scan the unminified source.", "compilation_jscript")
+    excludes = json.loads(os.environ.get("SOURCE_EXCLUDES") or "[]")
+    spec = ["--", "."] + [f":(exclude,glob){g}" for g in excludes] if excludes else []
+    dest = out / "veracode-source.zip"
+    res = subprocess.run(["git", "archive", "--format=zip", "-o", str(dest), "HEAD", *spec], capture_output=True, text=True)
+    if res.returncode != 0:
+        warn(f"git archive failed: {res.stderr.strip()[-300:]}")
+    else:
+        units.append(dest.name)
+        with zipfile.ZipFile(dest) as z:
+            names = z.namelist()
+        if any("node_modules/" in n for n in names):
+            warn("node_modules is committed to the repository. Remove it from the scanned source.", "compilation_jscript")
+        js = [n for n in names if n.endswith(".js")]
+        if js and all(n.endswith(".min.js") for n in js):
+            warn("Only minified JavaScript found. Scan the unminified source.", "compilation_jscript")
+# Go: one zip per module, go.mod at the top of the module folder, dependencies vendored.
+modules = json.loads(os.environ.get("GO_MODULES") or "[]")
+others = modules + json.loads(os.environ.get("GO_SKIP") or "[]")
+for d in modules:
+    name = re.sub(r"[^A-Za-z0-9._-]", "-", pathlib.PurePosixPath(d).name if d else "app")
+    stage = pathlib.Path("veracode-go") / name
+    while stage.exists():
+        stage = stage.with_name(stage.name + "_")
+    stage.mkdir(parents=True)
+    tar = subprocess.run(["git", "archive", "--format=tar", f"HEAD:{d}" if d else "HEAD"], capture_output=True, check=True).stdout
+    with tarfile.open(fileobj=io.BytesIO(tar)) as t:
+        try:
+            t.extractall(stage, filter="data")
+        except TypeError:
+            t.extractall(stage)
+    for other in others:  # one module per upload: drop nested modules
+        if other != d and (not d or other.startswith(d + "/")):
+            shutil.rmtree(stage / (other[len(d) + 1:] if d else other), ignore_errors=True)
+    gomod = (stage / "go.mod").read_text(errors="replace") if (stage / "go.mod").exists() else ""
+    if re.search(r"^\s*replace\b", gomod, re.M):
+        warn(f"{d or '.'}/go.mod uses replace directives, which Veracode can't resolve. Remove them for scanning.", "compilation_go")
+    go = shutil.which("go")
+    if go:
+        try:
+            res = subprocess.run([go, "mod", "vendor"], cwd=stage, capture_output=True, text=True, timeout=900)
+            if res.returncode != 0:
+                warn(f"go mod vendor failed in {d or '.'} ({res.stderr.strip()[-200:]}); scanned without vendored dependencies.", "compilation_go")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            warn(f"go mod vendor didn't run in {d or '.'} ({type(exc).__name__}); scanned without vendored dependencies.", "compilation_go")
+    else:
+        warn("Go isn't installed on this runner, so dependencies weren't vendored.", "compilation_go")
+    zip_tree(dest_for(f"veracode-go-{stage.name}.zip"), sorted(p for p in stage.rglob("*") if p.is_file()), stage, stage.name)
+shutil.rmtree("veracode-go", ignore_errors=True)
 for name in units:
     path = out / name
     if path.suffix.lower() in (".jar", ".war", ".ear"):
@@ -1182,7 +1472,7 @@ def render_jobs(plan: Plan, cfg: dict, actions: dict) -> list[str]:
     runner = _yq(str(cfg["runner"]))
     out: list[str] = []
     perms = ["  permissions:", "    contents: read"]
-    scans = selected_scans(cfg)
+    scans = plan.sast_scans
     has_units = "needs.veracode-prepare.outputs.units != '[]'"
     if plan.sast_mode != "off" and scans:
         out += ["veracode-prepare:", "  name: Veracode SAST prepare"]
@@ -1197,6 +1487,13 @@ def render_jobs(plan: Plan, cfg: dict, actions: dict) -> list[str]:
         source = "source" in plan.sast_mode
         if source:
             out += ["    - name: Checkout", f"      uses: {actions['checkout']}"]
+        env = [f"        SOURCE_ZIP: '{'true' if source and plan.source_zip else 'false'}'"]
+        if plan.source_excludes:
+            env.append(f"        SOURCE_EXCLUDES: {_yq(json.dumps(plan.source_excludes))}")
+        if plan.go_modules:
+            env.append(f"        GO_MODULES: {_yq(json.dumps(plan.go_modules))}")
+        if plan.go_skip:
+            env.append(f"        GO_SKIP: {_yq(json.dumps(plan.go_skip))}")
         if plan.sast_mode.startswith("binary"):
             out += ["    - name: Download build output", f"      uses: {actions['download']}", "      with:"]
             if plan.reuse and not plan.reuse[1]:
@@ -1206,8 +1503,7 @@ def render_jobs(plan: Plan, cfg: dict, actions: dict) -> list[str]:
                 out += [f"        pattern: {_yq(pattern)}", "        merge-multiple: true"]
             out.append(f"        path: {BUILD_ARTIFACT}")
         out += ["    - name: Package and check for Veracode", "      id: units", "      shell: bash",
-                "      env:", f"        SOURCE_ZIP: '{'true' if source else 'false'}'",
-                "      run: |", "        python3 - <<'PY'"]
+                "      env:", *env, "      run: |", "        python3 - <<'PY'"]
         out += [f"        {line}" if line else "" for line in PREPARE_SCRIPT.splitlines()]
         out += ["        PY",
                 "    - name: Upload scan units", "      if: steps.units.outputs.units != '[]'",
@@ -1434,100 +1730,251 @@ class GitHubError(Exception):
         self.status = status
 
 
+PUBLIC_API = "https://api.github.com"
+
+
+def graphql_url(api: str) -> str:
+    """github.com: <api>/graphql. GHES: https://host/api/v3 -> https://host/api/graphql."""
+    if os.environ.get("GITHUB_GRAPHQL_URL"):
+        return os.environ["GITHUB_GRAPHQL_URL"].rstrip("/")
+    return api[:-len("/v3")] + "/graphql" if api.endswith("/api/v3") else api + "/graphql"
+
+
+def run_token_command(cmd: str) -> str:
+    """Run the operator's token command (no shell) and return the token it prints. Output is never logged."""
+    argv = shlex.split(cmd, posix=os.name != "nt")
+    if os.name == "nt":
+        argv = [a[1:-1] if len(a) > 1 and a[0] == a[-1] and a[0] in "\"'" else a for a in argv]
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ToolError(f"--token-command failed to run ({type(exc).__name__})") from None
+    token = res.stdout.strip()
+    if res.returncode != 0 or not token or any(c.isspace() for c in token):
+        raise ToolError(f"--token-command exited {res.returncode} without printing a single token")
+    return token
+
+
+class _NoCredentialRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow redirects, but never send the token to another host or over plain HTTP."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        old, nxt = urllib.parse.urlsplit(req.full_url), urllib.parse.urlsplit(newurl)
+        if new is not None and (old.netloc != nxt.netloc or nxt.scheme != old.scheme):
+            new.remove_header("Authorization")
+        return new
+
+
+_OPENER = urllib.request.build_opener(_NoCredentialRedirect)
+
+
 class GitHub:
-    """Serial REST client: waits out rate limits instead of failing, paces writes."""
+    """Serial REST + GraphQL client for org-wide runs.
 
-    WRITE_INTERVAL = 1.0      # seconds between writes (secondary rate limit guidance)
+    - Primary limits are tracked per resource (core, graphql) from the response headers. The client pauses
+      before a resource drops below LOW_WATER, instead of failing.
+    - Secondary limits (403/429): Retry-After, else X-RateLimit-Reset, else >= 60 s doubling (GitHub's guidance).
+    - 5xx and network errors: bounded retries with jittered backoff. 401/403/404 are not retried, except one
+      401 retry after --token-command issues a new token.
+    - Content-creating requests stay under GitHub's documented 80 a minute and 500 an hour.
+    Serial on purpose: the hourly budget bounds a run, and GitHub also limits concurrent requests and
+    server time per minute.
+    """
+
     LOW_WATER = 25            # pause when fewer calls than this remain
-    MAX_RATE_WAITS = 12
+    MAX_RATE_WAITS = 12       # per request
+    MAX_TRANSIENT = 3         # 5xx / network retries per request
+    MAX_SINGLE_WAIT = 3700    # seconds
+    WRITE_INTERVAL = 1.0      # seconds between writes
+    WRITES_PER_MINUTE = 80
+    WRITES_PER_HOUR = 500
+    TIMEOUT = 60
 
-    def __init__(self, token: str, api: str):
+    def __init__(self, token: str, api: str, *, token_command: str | None = None,
+                 writes_per_hour: int | None = None, debug: bool = False):
+        parts = urllib.parse.urlsplit(api)
+        if parts.scheme not in ("https", "http") or not parts.netloc:
+            raise ToolError(f"GITHUB_API_URL must be an http(s) URL, got {api!r}")
+        if parts.scheme == "http" and parts.hostname not in ("127.0.0.1", "localhost", "::1"):
+            print(f"warning: {api} is plain HTTP; the token is sent unencrypted", file=sys.stderr)
         self.token, self.api = token, api.rstrip("/")
+        self.gql = graphql_url(self.api)
+        self.graphql_enabled = True
+        self.token_command, self.debug = token_command, debug
+        self.writes_per_hour = writes_per_hour or self.WRITES_PER_HOUR
         self.last_headers: dict = {}
-        self.calls = 0
+        self.budget: dict[str, tuple[int, float, int]] = {}   # resource -> (remaining, local reset, limit)
+        self.stats = dict.fromkeys(("rest", "graphql", "writes", "retries", "rate_waits", "token_refreshes"), 0)
+        self.waited = 0.0
+        self._writes: deque = deque()
         self._last_write = 0.0
+        self._login: str | None | bool = False
 
-    def _headers(self) -> dict:
-        return {k.lower(): v for k, v in self.last_headers.items()}
+    @property
+    def calls(self) -> int:
+        return self.stats["rest"] + self.stats["graphql"]
+
+    # -- waiting -------------------------------------------------------------
 
     def _sleep(self, seconds: float, why: str) -> None:
-        print(f"   ... {why}; waiting {int(seconds)}s", file=sys.stderr, flush=True)
+        seconds = max(0.0, min(seconds, self.MAX_SINGLE_WAIT))
+        print(f"   ... {why}; waiting {int(seconds + 0.5)}s", file=sys.stderr, flush=True)
+        self.waited += seconds
         time.sleep(seconds)
 
-    def _reset_in(self) -> float | None:
-        h = self._headers()
+    def _backoff(self, attempt: int, why: str) -> None:
+        self.stats["retries"] += 1
+        self._sleep(2 ** attempt + random.uniform(0, 1), f"{why}; retry {attempt}/{self.MAX_TRANSIENT}")
+
+    @staticmethod
+    def _server_now(h: dict) -> float:
+        try:
+            return email.utils.parsedate_to_datetime(h["date"]).timestamp()
+        except (KeyError, TypeError, ValueError):
+            return time.time()
+
+    def _note(self, h: dict, resource: str) -> None:
+        rem, reset, lim = (h.get(f"x-ratelimit-{k}", "") for k in ("remaining", "reset", "limit"))
+        if rem.isdigit() and reset.isdigit():
+            skew = time.time() - self._server_now(h)
+            self.budget[h.get("x-ratelimit-resource") or resource] = (
+                int(rem), int(reset) + skew, int(lim) if lim.isdigit() else 0)
+
+    def _before(self, resource: str) -> None:
+        b = self.budget.get(resource)
+        if b and b[0] < self.LOW_WATER:
+            wait = b[1] - time.time() + 1
+            if wait > 0:
+                self.stats["rate_waits"] += 1
+                self._sleep(wait, f"GitHub {resource} API budget nearly used ({b[0]} left), "
+                                  f"resets at {time.strftime('%H:%M', time.localtime(b[1]))}")
+            self.budget.pop(resource, None)
+
+    def _pace_write(self) -> None:
+        gap = self.WRITE_INTERVAL - (time.monotonic() - self._last_write)
+        if gap > 0:
+            time.sleep(gap)
+        per_minute = min(self.WRITES_PER_MINUTE, self.writes_per_hour)
+        while True:
+            now = time.monotonic()
+            while self._writes and now - self._writes[0] >= 3600:
+                self._writes.popleft()
+            recent = [t for t in self._writes if now - t < 60]
+            if len(recent) >= per_minute:
+                self._sleep(60 - (now - recent[0]) + 0.5, f"pacing writes ({per_minute} a minute)")
+            elif len(self._writes) >= self.writes_per_hour:
+                self._sleep(3600 - (now - self._writes[0]) + 0.5,
+                            f"pacing writes ({self.writes_per_hour} content-creating requests an hour)")
+            else:
+                self._writes.append(now)
+                return
+
+    @staticmethod
+    def _rate_limited(status: int, msg: str, h: dict) -> bool:
+        if status == 429:
+            return True
+        m = msg.lower()
+        return status == 403 and (h.get("x-ratelimit-remaining") == "0" or "rate limit" in m
+                                  or "abuse" in m or "retry-after" in h)
+
+    def _rate_wait(self, h: dict, attempt: int) -> float:
+        ra = h.get("retry-after", "")
+        if ra.isdigit():
+            return int(ra) + 1
         reset = h.get("x-ratelimit-reset", "")
         if h.get("x-ratelimit-remaining") == "0" and reset.isdigit():
-            return max(1.0, int(reset) - time.time() + 2)
-        return None
+            return max(1.0, int(reset) - self._server_now(h) + 1)
+        base = min(60 * 2 ** (attempt - 1), 900)
+        return base + random.uniform(0, base / 10)
 
-    def _throttle(self) -> None:
-        h = self._headers()
-        rem, reset = h.get("x-ratelimit-remaining", ""), h.get("x-ratelimit-reset", "")
-        if rem.isdigit() and int(rem) < self.LOW_WATER and reset.isdigit():
-            wait = int(reset) - time.time() + 2
-            if wait > 0:
-                self._sleep(min(wait, 3700), f"GitHub API budget nearly used ({rem} left)")
+    # -- requests ------------------------------------------------------------
+
+    def _open(self, method: str, url: str, data: bytes | None):
+        headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
+                   "User-Agent": f"{TOOL}/{VERSION}"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        if data:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        with _OPENER.open(req, timeout=self.TIMEOUT) as resp:
+            return resp.status, dict(resp.headers), resp.read()
 
     def request(self, method: str, path: str, body: dict | None = None, allow: tuple = ()):
         url = path if path.startswith("http") else f"{self.api}{path}"
         data = json.dumps(body).encode() if body is not None else None
-        if method != "GET":
-            gap = self.WRITE_INTERVAL - (time.monotonic() - self._last_write)
-            if gap > 0:
-                time.sleep(gap)
+        graphql = url == self.gql
+        resource = "graphql" if graphql else "core"
+        write = method != "GET" and not graphql
         transient = limited = 0
+        refreshed = False
         while True:
-            req = urllib.request.Request(url, data=data, method=method, headers={
-                "Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28", "User-Agent": f"{TOOL}/{VERSION}",
-                **({"Content-Type": "application/json"} if data else {})})
+            self._before(resource)
+            if write:
+                self._pace_write()
+                self._last_write = time.monotonic()
+            started = time.monotonic()
             try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    self.calls += 1
-                    self.last_headers = dict(resp.headers)
-                    raw = resp.read()
-                    status = resp.status
-                if method != "GET":
-                    self._last_write = time.monotonic()
-                self._throttle()
+                status, headers, raw = self._open(method, url, data)
+            except urllib.error.HTTPError as exc:
+                status, headers = exc.code, dict(exc.headers or {})
+                try:
+                    raw = exc.read()
+                except (OSError, http.client.HTTPException):
+                    raw = b""
+            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
+                reason = str(getattr(exc, "reason", exc)) or type(exc).__name__
+                if transient < self.MAX_TRANSIENT:
+                    transient += 1
+                    self._backoff(transient, f"network error ({reason})")
+                    continue
+                raise GitHubError(0, f"network error: {reason}") from None
+            self.stats["graphql" if graphql else "rest"] += 1
+            if write:
+                self.stats["writes"] += 1
+            self.last_headers = headers
+            h = {k.lower(): v for k, v in headers.items()}
+            self._note(h, resource)
+            if self.debug:
+                b = self.budget.get(resource)
+                print(f"debug: {method} {url.split('?')[0]} -> {status} "
+                      f"{int((time.monotonic() - started) * 1000)}ms"
+                      + (f" ({resource} {b[0]} left)" if b else ""), file=sys.stderr)
+            if 200 <= status < 300:
                 try:
                     return status, (json.loads(raw) if raw else None)
                 except ValueError:
                     raise GitHubError(status, "response is not JSON (proxy or wrong GITHUB_API_URL?)") from None
-            except urllib.error.HTTPError as exc:
-                self.calls += 1
-                raw = exc.read()
-                self.last_headers = dict(exc.headers or {})
-                try:
-                    payload = json.loads(raw) if raw else {}
-                except ValueError:
-                    payload = {"message": raw[:200].decode(errors="replace")}
-                msg = payload.get("message", "") if isinstance(payload, dict) else ""
-                h = self._headers()
-                rate = exc.code == 429 or (exc.code == 403 and (
-                    "rate limit" in msg.lower() or h.get("x-ratelimit-remaining") == "0"))
-                if rate and limited < self.MAX_RATE_WAITS:
-                    limited += 1
-                    wait = self._reset_in()
-                    if wait is None:
-                        ra = h.get("retry-after", "")
-                        wait = int(ra) if ra.isdigit() else min(60 * 2 ** (limited - 1), 900)
-                    self._sleep(min(wait, 3700), f"GitHub rate limit ({exc.code})")
-                    continue
-                if exc.code >= 500 and transient < 3:
-                    transient += 1
-                    time.sleep(2 ** transient)
-                    continue
-                if exc.code in allow:
-                    return exc.code, payload
-                raise GitHubError(exc.code, msg or "request failed") from None
-            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
-                if transient < 3:
-                    transient += 1
-                    time.sleep(2 ** transient)
-                    continue
-                raise GitHubError(0, str(getattr(exc, "reason", exc))) from None
+            try:
+                payload = json.loads(raw) if raw else {}
+            except ValueError:
+                payload = {"message": raw[:200].decode(errors="replace")}
+            msg = payload.get("message", "") if isinstance(payload, dict) else ""
+            if self._rate_limited(status, msg, h):
+                if limited >= self.MAX_RATE_WAITS:
+                    raise GitHubError(status, f"still rate limited after {limited} waits: {msg}")
+                limited += 1
+                self.stats["rate_waits"] += 1
+                kind = "secondary rate limit" if h.get("x-ratelimit-remaining") != "0" else "rate limit"
+                self._sleep(self._rate_wait(h, limited), f"GitHub {kind} ({status})")
+                self.budget.pop(resource, None)  # already waited for this reset
+                continue
+            if status == 401 and self.token_command and not refreshed:
+                refreshed = True
+                self.token = run_token_command(self.token_command)
+                self.stats["token_refreshes"] += 1
+                print("   ... token refreshed with --token-command", file=sys.stderr, flush=True)
+                continue
+            if status >= 500 and transient < self.MAX_TRANSIENT:
+                transient += 1
+                self._backoff(transient, f"GitHub HTTP {status}")
+                continue
+            if status in allow:
+                return status, payload
+            if status == 403 and h.get("x-accepted-github-permissions"):
+                msg += f" (token needs: {h['x-accepted-github-permissions']})"
+            raise GitHubError(status, msg or "request failed")
 
     def get(self, path: str, allow404: bool = False):
         status, data = self.request("GET", path, allow=(404,) if allow404 else ())
@@ -1542,9 +1989,49 @@ class GitHub:
             if not isinstance(items, list):
                 raise GitHubError(0, f"unexpected response shape for {path}")
             out += items
-            if len(items) < 100:
+            link = {k.lower(): v for k, v in self.last_headers.items()}.get("link")
+            if (link is not None and 'rel="next"' not in link) or (link is None and len(items) < 100):
                 return out
             page += 1
+
+    def graphql(self, query: str, variables: dict) -> dict | None:
+        """Data of a read-only query, or None when the caller should use REST for this repo."""
+        if not self.graphql_enabled:
+            return None
+        for attempt in range(1, self.MAX_RATE_WAITS + 2):
+            try:
+                status, payload = self.request("POST", self.gql, {"query": query, "variables": variables},
+                                               allow=(400, 403, 404, 405, 422))
+            except GitHubError as exc:
+                if exc.status == 401:
+                    raise
+                return None
+            if status != 200 or not isinstance(payload, dict):
+                self.graphql_enabled = False
+                print(f"   ... GraphQL API unavailable (HTTP {status}); using REST only", file=sys.stderr)
+                return None
+            errors = [e for e in payload.get("errors") or [] if isinstance(e, dict)]
+            if any(e.get("type") == "RATE_LIMITED" for e in errors) and attempt <= self.MAX_RATE_WAITS:
+                self.stats["rate_waits"] += 1
+                h = {k.lower(): v for k, v in self.last_headers.items()}
+                self._sleep(self._rate_wait(h, attempt), "GitHub GraphQL rate limit")
+                self.budget.pop("graphql", None)
+                continue
+            if errors:
+                if not any(e.get("path") or e.get("type") == "RATE_LIMITED" for e in errors):
+                    # Query rejected as a whole (e.g. an older GHES schema): REST from now on.
+                    self.graphql_enabled = False
+                    print("   ... GraphQL query rejected; using REST only", file=sys.stderr)
+                return None
+            return payload.get("data")
+        return None
+
+    def login(self) -> str | None:
+        """The token's user login, or None for GitHub App installation tokens."""
+        if self._login is False:
+            status, data = self.request("GET", "/user", allow=(403,))
+            self._login = data.get("login") if status == 200 and isinstance(data, dict) else None
+        return self._login
 
 
 def resolve_token() -> str:
@@ -1557,15 +2044,25 @@ def resolve_token() -> str:
         res = None
     if res and res.returncode == 0 and res.stdout.strip():
         return res.stdout.strip()
-    raise ToolError("No GitHub token: set GH_TOKEN/GITHUB_TOKEN or run `gh auth login`.")
+    raise ToolError("No GitHub token: set GH_TOKEN/GITHUB_TOKEN, use --token-command, or run `gh auth login`.")
 
 
 def q(s: str) -> str:
     return urllib.parse.quote(s, safe="")
 
 
+_REPO_KEYS = ("name", "full_name", "default_branch", "archived", "disabled", "fork", "html_url")
+
+
+def _slim(r: dict) -> dict:
+    """Keep only what the run needs: full repo objects are ~5 KB each."""
+    out = {k: r.get(k) for k in _REPO_KEYS}
+    out["owner"] = {"login": (r.get("owner") or {}).get("login")}
+    return out
+
+
 def list_targets(gh: GitHub, targets: list[str], excludes: list[str], include_forks: bool,
-                 login: str) -> tuple[list[dict], list[str]]:
+                 login: str | None = None) -> tuple[list[dict], list[str]]:
     """Resolve targets to repos. Returns (repos, explicit repos that were not found)."""
     repos: dict[str, dict] = {}
     missing: list[str] = []
@@ -1584,14 +2081,16 @@ def list_targets(gh: GitHub, targets: list[str], excludes: list[str], include_fo
                 continue
             candidates = [repo]
         else:
-            if owner.lower() == login.lower():
-                candidates = [r for r in gh.paginate("/user/repos?affiliation=owner")
-                              if r["owner"]["login"].lower() == owner.lower()]
+            status, _ = gh.request("GET", f"/orgs/{q(owner)}", allow=(404,))
+            if status != 404:
+                candidates = gh.paginate(f"/orgs/{q(owner)}/repos?type=all")
             else:
-                status, _ = gh.request("GET", f"/orgs/{q(owner)}", allow=(404,))
-                kind = "orgs" if status != 404 else "users"
-                candidates = gh.paginate(f"/{kind}/{q(owner)}/repos?type=all" if kind == "orgs"
-                                         else f"/users/{q(owner)}/repos?type=owner")
+                me = login or gh.login()
+                if me and me.lower() == owner.lower():
+                    candidates = [r for r in gh.paginate("/user/repos?affiliation=owner")
+                                  if r["owner"]["login"].lower() == owner.lower()]
+                else:
+                    candidates = gh.paginate(f"/users/{q(owner)}/repos?type=owner")
             candidates = [r for r in candidates if fnmatch.fnmatch(r["name"].lower(), pattern.lower())]
             candidates = [r for r in candidates if not r.get("archived") and not r.get("disabled")
                           and (include_forks or not r.get("fork"))]
@@ -1599,7 +2098,7 @@ def list_targets(gh: GitHub, targets: list[str], excludes: list[str], include_fo
             full = r["full_name"]
             if any(fnmatch.fnmatch(full.lower(), e.lower()) for e in excludes):
                 continue
-            repos[full.lower()] = r
+            repos[full.lower()] = _slim(r)
     return sorted(repos.values(), key=lambda r: r["full_name"].lower()), missing
 
 
@@ -1619,11 +2118,94 @@ def branch_sha(gh: GitHub, full: str, branch: str) -> str | None:
     return data["object"]["sha"] if isinstance(data, dict) and data.get("object") else None
 
 
+WORKFLOW_DIR = ".github/workflows"
+SYMLINK_MODE = 0o120000
+SNAPSHOT_QUERY = """
+query($owner: String!, $name: String!, $branch: String!, $onDefault: String!, $onBranch: String!,
+      $files: Boolean!) {
+  repository(owner: $owner, name: $name) {
+    defaultBranchRef { name target { oid } }
+    ref(qualifiedName: $branch) @include(if: $files) { target { oid } }
+    languages(first: 100) { totalCount edges { size node { name } } }
+    onDefault: object(expression: $onDefault) @include(if: $files) { ...workflows }
+    onBranch: object(expression: $onBranch) @include(if: $files) { ...workflows }
+  }
+}
+fragment workflows on Tree {
+  entries { name type mode object { ... on Blob { oid isBinary isTruncated text } } }
+}
+"""
+
+
+def git_blob_sha(data: bytes) -> str:
+    return hashlib.sha1(b"blob %d\0" % len(data) + data, usedforsecurity=False).hexdigest()  # git object id
+
+
+@dataclass
+class Snapshot:
+    """What one GraphQL query returns for a repo; replaces 4 + one-per-workflow-file REST calls."""
+    languages: dict = field(default_factory=dict)
+    default_sha: str | None = None
+    branch_sha: str | None = None
+    workflows: dict = field(default_factory=dict)   # ref -> {path: (text, blob sha)}, None if no directory
+
+
+def fetch_snapshot(gh: GitHub, full: str, default: str, branch: str, files: bool = True) -> Snapshot | None:
+    """Languages, branch heads and every workflow file on both refs, or None (use REST)."""
+    owner, _, name = full.partition("/")
+    data = gh.graphql(SNAPSHOT_QUERY, {
+        "owner": owner, "name": name, "branch": f"refs/heads/{branch}", "files": files,
+        "onDefault": f"refs/heads/{default}:{WORKFLOW_DIR}", "onBranch": f"refs/heads/{branch}:{WORKFLOW_DIR}"})
+    repo = (data or {}).get("repository")
+    if not isinstance(repo, dict):
+        return None
+    snap = Snapshot()
+    langs = repo.get("languages") or {}
+    if (langs.get("totalCount") or 0) > 100:
+        snap.languages = gh.get(f"/repos/{full}/languages", allow404=True) or {}
+    else:
+        snap.languages = {e["node"]["name"]: e["size"] for e in langs.get("edges") or []
+                          if isinstance(e, dict) and isinstance(e.get("node"), dict)}
+    if not files:
+        return snap
+    head = repo.get("defaultBranchRef") or {}
+    if head.get("name") == default:
+        snap.default_sha = (head.get("target") or {}).get("oid")
+    snap.branch_sha = ((repo.get("ref") or {}).get("target") or {}).get("oid")
+    for ref, key in ((default, "onDefault"), (branch, "onBranch")):
+        tree = repo.get(key)
+        if not isinstance(tree, dict) or not isinstance(tree.get("entries"), list):
+            snap.workflows[ref] = None
+            continue
+        got: dict[str, tuple[str, str]] = {}
+        for e in tree["entries"]:
+            nm = str(e.get("name", ""))
+            if e.get("type") != "blob" or e.get("mode") == SYMLINK_MODE or not nm.lower().endswith((".yml", ".yaml")):
+                continue
+            path, obj = f"{WORKFLOW_DIR}/{nm}", e.get("object") or {}
+            text = obj.get("text")
+            # Only use text that hashes to the blob id; anything else is read byte-exact over REST.
+            if isinstance(text, str) and not obj.get("isTruncated") and not obj.get("isBinary") and \
+                    git_blob_sha(text.encode("utf-8")) == obj.get("oid"):
+                got[path] = (text, obj["oid"])
+            else:
+                exact = read_file(gh, full, path, ref)
+                if exact:
+                    got[path] = exact
+        snap.workflows[ref] = got
+    return snap
+
+
 def pin_actions(gh: GitHub) -> dict:
+    """Resolve the action tags to commit SHAs on github.com; anonymously on GHES, so its token stays there."""
+    src = gh if gh.api == PUBLIC_API else GitHub("", PUBLIC_API)
     pinned = {}
     for key, ref in ACTIONS.items():
         repo, tag = ref.split("@")
-        data = gh.get(f"/repos/{repo}/commits/{q(tag)}")
+        try:
+            data = src.get(f"/repos/{repo}/commits/{q(tag)}")
+        except GitHubError as exc:
+            raise ToolError(f"--pin-sha: cannot resolve {ref} on github.com ({exc}); pin by hand or drop --pin-sha") from None
         pinned[key] = f"{repo}@{data['sha']} # {tag}"
     return pinned
 
@@ -1643,14 +2225,17 @@ def check_secrets(gh: GitHub, full: str, plan: Plan) -> tuple[list[Check], list[
     needed = list(SECRET_API) + ([SECRET_SCA] if plan.sca else [])
     names: set = set()
     readable = False
-    for path in (f"/repos/{full}/actions/secrets", f"/repos/{full}/actions/organization-secrets"):
+    for path in (f"/repos/{full}/actions/organization-secrets", f"/repos/{full}/actions/secrets"):
         try:
             names |= {s["name"] for s in gh.paginate(path, key="secrets")}
             readable = True
         except GitHubError as exc:
-            # 422: user-owned repo (no org secrets).
-            if exc.status not in (403, 404, 422):
+            if exc.status == 403:  # both endpoints need the same permission
+                break
+            if exc.status not in (404, 422):  # 422: user-owned repo (no org secrets)
                 raise
+        if set(needed) <= names:
+            break
     if not readable:
         return [Check("WARN", "secrets", "cannot list secrets (needs admin access); check them manually")], \
             [f"Make sure these Actions secrets exist: {', '.join(needed)} ({DOCS['creds']})"]
@@ -1740,6 +2325,8 @@ class Result:
     reasons: dict = field(default_factory=dict)
     decided: dict = field(default_factory=dict)
     url: str = ""
+    api_calls: int = 0
+    seconds: float = 0.0
 
 
 def choose_workflow(files: dict[str, str], det: Detection, cfg: dict, removing: bool = False,
@@ -1833,7 +2420,12 @@ def process_repo(gh: GitHub, repo: dict, cfg: dict, actions: dict, args) -> Resu
     if branch == default:
         res.detail = f"branch {branch!r} is the default branch; choose another branch"
         return res
-    on_branch = None if args.detect_only else branch_sha(gh, full, branch)
+    # One GraphQL query: languages, branch heads and every workflow file on both refs. None: REST below.
+    snap = fetch_snapshot(gh, full, default, branch, files=not args.detect_only)
+    if args.detect_only:
+        on_branch = None
+    else:
+        on_branch = snap.branch_sha if snap else branch_sha(gh, full, branch)
     ref = branch if on_branch else default  # workflow source: keeps edits made on the branch
 
     # Detection always reads the default branch: it holds the current code.
@@ -1844,7 +2436,7 @@ def process_repo(gh: GitHub, repo: dict, cfg: dict, actions: dict, args) -> Resu
     blobs = [t for t in tree.get("tree") or [] if isinstance(t, dict) and t.get("type") == "blob"]
     paths = [t["path"] for t in blobs if isinstance(t.get("path"), str)]
     sizes = {t["path"]: t.get("size") for t in blobs if isinstance(t.get("path"), str)}
-    linguist = gh.get(f"/repos/{full}/languages", allow404=True) or {}
+    linguist = snap.languages if snap else (gh.get(f"/repos/{full}/languages", allow404=True) or {})
     if not isinstance(linguist, dict):
         linguist = {}
 
@@ -1870,17 +2462,25 @@ def process_repo(gh: GitHub, repo: dict, cfg: dict, actions: dict, args) -> Resu
                           "use another --branch, or --force to add to it")
             return res
 
-    listing = gh.get(f"/repos/{full}/contents/.github/workflows?ref={q(ref)}", allow404=True)
-    if not isinstance(listing, list):
-        res.detail = "no .github/workflows directory"
-        return res
     files, shas = {}, {}
-    for item in listing:
-        if isinstance(item, dict) and item.get("type") == "file" and \
-                str(item.get("name", "")).lower().endswith((".yml", ".yaml")):
-            got = read_file(gh, full, item["path"], ref)
-            if got:
-                files[item["path"]], shas[item["path"]] = got
+    if snap:
+        on_ref = snap.workflows.get(ref)
+        if on_ref is None:
+            res.detail = "no .github/workflows directory"
+            return res
+        for path, (text, sha) in on_ref.items():
+            files[path], shas[path] = text, sha
+    else:
+        listing = gh.get(f"/repos/{full}/contents/{WORKFLOW_DIR}?ref={q(ref)}", allow404=True)
+        if not isinstance(listing, list):
+            res.detail = "no .github/workflows directory"
+            return res
+        for item in listing:
+            if isinstance(item, dict) and item.get("type") == "file" and \
+                    str(item.get("name", "")).lower().endswith((".yml", ".yaml")):
+                got = read_file(gh, full, item["path"], ref)
+                if got:
+                    files[item["path"]], shas[item["path"]] = got
     if not files:
         res.detail = "no workflow files"
         return res
@@ -1891,7 +2491,8 @@ def process_repo(gh: GitHub, repo: dict, cfg: dict, actions: dict, args) -> Resu
         old = base = wf.text
         if on_branch and not args.remove:
             # The branch copy must match the default branch outside the managed blocks.
-            on_default = read_file(gh, full, wf.path, default)
+            on_default = (snap.workflows.get(default) or {}).get(wf.path) if snap \
+                else read_file(gh, full, wf.path, default)
             if on_default is None:
                 raise Skip(f"{wf.path} is not on {default}; delete the branch {branch} and re-run")
             if strip_managed(old)[0] != strip_managed(on_default[0])[0]:
@@ -1938,51 +2539,91 @@ def process_repo(gh: GitHub, repo: dict, cfg: dict, actions: dict, args) -> Resu
         return res
 
     if not on_branch:
-        base_sha = branch_sha(gh, full, default)
+        base_sha = (snap.default_sha if snap else None) or branch_sha(gh, full, default)
         if not base_sha:
             res.outcome, res.detail = "failed", f"cannot read the head of {default}"
             return res
         status, _ = gh.request("POST", f"/repos/{full}/git/refs",
                                {"ref": f"refs/heads/{branch}", "sha": base_sha}, allow=(422,))
-        if status == 422:
+        # 422 after a retried request whose first attempt succeeded: the branch is ours if it sits at base_sha.
+        if status == 422 and branch_sha(gh, full, branch) != base_sha:
             res.outcome, res.detail = "failed", f"branch {branch} appeared during the run; re-run this repo"
             return res
     body = {"message": commit_message(plan, args.remove), "branch": branch,
             "content": base64.b64encode(new.encode("utf-8")).decode(), "sha": shas[wf.path]}
     status, data = gh.request("PUT", f"/repos/{full}/contents/{urllib.parse.quote(wf.path)}", body,
                               allow=(409,))
+    verified = False
     if status == 409:
-        res.outcome, res.detail = "failed", f"{wf.path} changed on {branch} during the run; re-run this repo"
-        return res
+        # A retried PUT whose first attempt succeeded also lands here: check what the branch holds now.
+        now = read_file(gh, full, wf.path, branch)
+        if not now or now[0] != new:
+            res.outcome, res.detail = "failed", f"{wf.path} changed on {branch} during the run; re-run this repo"
+            return res
+        verified = True
     res.outcome = "removed" if args.remove else "committed"
     res.url = f"{repo.get('html_url', '')}/tree/{branch}"
-    res.detail = ((data or {}).get("commit") or {}).get("sha", "")[:12]
+    res.detail = "verified on the branch" if verified else \
+        ((data or {}).get("commit") or {}).get("sha", "")[:12]
     return res
 
 
 REPORT_FIELDS = ["repo", "outcome", "workflow", "sast", "sca", "iac", "detail", "todos", "branch_url",
-                 "sast_reason", "sca_reason", "iac_reason", "runner_reason", "notes"]
+                 "sast_reason", "sca_reason", "iac_reason", "runner_reason", "notes", "mode", "api_calls", "seconds"]
+# Outcomes that count as done when resuming, per run mode.
+DONE = {"detect": {"detected"}, "dry-run": {"would_change", "up_to_date"}, "write": {"committed", "up_to_date"},
+        "remove-dry-run": {"would_change", "up_to_date"}, "remove": {"removed", "up_to_date"}}
+
+
+def run_mode(args) -> str:
+    if args.detect_only:
+        return "detect"
+    return ("remove" if args.remove else "write" if not args.dry_run else "dry-run") \
+        if not (args.remove and args.dry_run) else "remove-dry-run"
 
 
 class Report:
-    """CSV written row by row, so an interrupted run keeps its results."""
+    """CSV written row by row (flushed and fsynced), so an interrupted run keeps its results."""
 
-    def __init__(self, path: str | None, resume: bool):
-        self.path, self.done, self.fh, self.writer = path, set(), None, None
+    def __init__(self, path: str | None, resume: bool, mode: str = "write"):
+        self.path, self.mode, self.done, self.fh, self.writer = path, mode, set(), None, None
+        self.retry = 0
         if not path:
             return
         exists = os.path.exists(path) and os.path.getsize(path) > 0
+        fields = REPORT_FIELDS
         if resume and exists:
+            with open(path, "rb+") as fh:  # drop a row cut off by a crash mid-write
+                data = fh.read()
+                if not data.endswith(b"\n"):
+                    fh.truncate(data.rfind(b"\n") + 1)
             with open(path, newline="", encoding="utf-8") as fh:
-                rows = list(csv.DictReader(fh))
-            if rows and set(REPORT_FIELDS) - set(rows[0]):
+                reader = csv.DictReader(fh)
+                rows = list(reader)
+                fields = reader.fieldnames or REPORT_FIELDS
+            if {"repo", "outcome", "detail"} - set(fields):
                 raise ToolError(f"{path} is not a report from this tool")
-            self.done = {r["repo"].lower() for r in rows if r.get("outcome") in TERMINAL}
+            has_mode = "mode" in fields
+            done, seen = set(), set()
+            for r in rows:
+                repo = (r.get("repo") or "").lower()
+                seen.add(repo)
+                same = r.get("mode") == mode if has_mode else not mode.startswith("remove")
+                if same and r.get("outcome") in DONE[mode]:
+                    done.add(repo)
+            self.done, self.retry = done, len(seen - done)
         self.fh = open(path, "a" if (resume and exists) else "w", newline="", encoding="utf-8")
-        self.writer = csv.writer(self.fh)
+        self.writer = csv.DictWriter(self.fh, fieldnames=fields, extrasaction="ignore")
         if not (resume and exists):
-            self.writer.writerow(REPORT_FIELDS)
-            self.fh.flush()
+            self.writer.writeheader()
+            self._sync()
+
+    def _sync(self) -> None:
+        self.fh.flush()
+        try:
+            os.fsync(self.fh.fileno())
+        except OSError:
+            pass
 
     def add(self, r: Result) -> None:
         if not self.writer:
@@ -1995,12 +2636,16 @@ class Report:
         def cell(v) -> str:
             v = str(v)
             return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
-        self.writer.writerow([cell(x) for x in (
-            r.repo, r.outcome, r.workflow, state("sast", r.sast), state("sca", r.sca), state("iac", r.iac),
-            r.detail, " | ".join(r.todos), r.url, why.get("sast", ""), why.get("sca", ""),
-            why.get("iac", ""), why.get("runner", ""),
-            " | ".join(c.detail for c in r.checks if c.name == "note"))])
-        self.fh.flush()
+        row = {
+            "repo": r.repo, "outcome": r.outcome, "workflow": r.workflow, "sast": state("sast", r.sast),
+            "sca": state("sca", r.sca), "iac": state("iac", r.iac), "detail": r.detail,
+            "todos": " | ".join(r.todos), "branch_url": r.url, "sast_reason": why.get("sast", ""),
+            "sca_reason": why.get("sca", ""), "iac_reason": why.get("iac", ""),
+            "runner_reason": why.get("runner", ""),
+            "notes": " | ".join(c.detail for c in r.checks if c.name == "note"),
+            "mode": self.mode, "api_calls": r.api_calls, "seconds": f"{r.seconds:.1f}"}
+        self.writer.writerow({k: cell(v) for k, v in row.items()})
+        self._sync()
 
     def close(self) -> None:
         if self.fh:
@@ -2008,37 +2653,76 @@ class Report:
             print(f"Report: {self.path}")
 
 
+def _fmt_secs(s: float) -> str:
+    s = int(s)
+    return f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+def print_api_summary(gh: GitHub, repos: int, elapsed: float) -> None:
+    st = gh.stats
+    per = f", {gh.calls / repos:.1f} per repo" if repos else ""
+    print(f"API calls: {gh.calls} ({st['rest']} REST + {st['graphql']} GraphQL{per}); writes {st['writes']}, "
+          f"retries {st['retries']}, rate-limit waits {st['rate_waits']} ({_fmt_secs(gh.waited)} waiting)"
+          + (f", token refreshes {st['token_refreshes']}" if st["token_refreshes"] else "")
+          + f"; elapsed {_fmt_secs(elapsed)}")
+    left = [f"{res} {b[0]}/{b[2]}" if b[2] else f"{res} {b[0]}" for res, b in sorted(gh.budget.items())]
+    if left:
+        reset = min(b[1] for b in gh.budget.values())
+        print(f"API budget left: {', '.join(left)} (resets {time.strftime('%H:%M', time.localtime(reset))})")
+
+
 def run_targets(args, cli_cfg: dict) -> int:
     base_cfg, overrides = load_config(args.config)
-    gh = GitHub(resolve_token(), os.environ.get("GITHUB_API_URL", "https://api.github.com"))
+    token = run_token_command(args.token_command) if args.token_command else resolve_token()
+    gh = GitHub(token, os.environ.get("GITHUB_API_URL", PUBLIC_API), token_command=args.token_command,
+                writes_per_hour=args.writes_per_hour, debug=args.debug)
+    started = time.monotonic()
+    # /rate_limit: checks the token without using budget, and works for GitHub App tokens (unlike /user).
     try:
-        user = gh.get("/user")
+        status, _ = gh.request("GET", "/rate_limit", allow=(404,))
     except GitHubError as exc:
-        raise ToolError(f"GitHub authentication failed ({exc})") from None
-    scopes = gh.last_headers.get("X-OAuth-Scopes") or gh.last_headers.get("x-oauth-scopes")
+        if exc.status in (401, 403):
+            raise GitHubError(exc.status, f"GitHub authentication failed: {exc}") from None
+        raise
+    scopes = {k.lower(): v for k, v in gh.last_headers.items()}.get("x-oauth-scopes")
     if scopes is not None and not (args.dry_run or args.detect_only):
         have = {s.strip() for s in scopes.split(",")}
         if not {"repo", "workflow"} <= have and not ({"public_repo", "workflow"} <= have):
             raise ToolError(f"token scopes '{scopes}' cannot write workflow files; "
                             "needs repo + workflow (gh auth refresh -s workflow)")
+    if status == 404 and not args.quiet:
+        print("GitHub API rate limiting is disabled on this server")
     actions = pin_actions(gh) if args.pin_sha else dict(ACTIONS)
-    repos, missing = list_targets(gh, args.target, args.exclude, args.include_forks, user["login"])
-    report = Report(args.report, args.resume)
-    results = [Result(m, "failed", detail="repository not found or no access") for m in missing]
-    for r in results:
-        report.add(r)
-        print_result(r, args.dry_run, args.quiet)
+    repos, missing = list_targets(gh, args.target, args.exclude, args.include_forks)
+    mode = run_mode(args)
+    report = Report(args.report, args.resume, mode)
+    counts: Counter = Counter()
+    all_done = True
+
+    def record(res: Result, prefix: str = "") -> None:
+        nonlocal all_done
+        counts[res.outcome] += 1
+        all_done = all_done and res.outcome in TERMINAL
+        report.add(res)
+        print_result(res, args.dry_run, args.quiet, prefix)
+
+    for m in missing:
+        record(Result(m, "failed", detail="repository not found or no access"))
     todo = [r for r in repos if r["full_name"].lower() not in report.done]
-    if report.done:
-        print(f"Resuming: {len(repos) - len(todo)} repositories already done in {args.report}")
+    if args.resume and args.report:
+        print(f"Resuming from {args.report} ({mode}): {len(repos) - len(todo)} done, {len(todo)} to go"
+              + (f", including {report.retry} that failed or were skipped before" if report.retry else ""))
     if not repos and not missing:
         print("No repositories matched the targets.")
         report.close()
         return 1
     changed, stopped = 0, None
+    same_403, last_403 = 0, ""
+    loop_start = time.monotonic()
     try:
         for i, repo in enumerate(todo, 1):
             cfg = effective_config(base_cfg, overrides, cli_cfg, repo["full_name"])
+            t0, c0 = time.monotonic(), gh.calls
             try:
                 res = process_repo(gh, repo, cfg, actions, args)
             except GitHubError as exc:
@@ -2051,26 +2735,38 @@ def run_targets(args, cli_cfg: dict) -> int:
                 if args.debug:
                     import traceback
                     traceback.print_exc()
-            results.append(res)
-            report.add(res)
-            print_result(res, args.dry_run, args.quiet, f"[{i}/{len(todo)}] ")
+            res.api_calls, res.seconds = gh.calls - c0, time.monotonic() - t0
+            left = (time.monotonic() - loop_start) / i * (len(todo) - i)
+            eta = f" ~{_fmt_secs(left)} left" if i >= 5 and left >= 60 else ""
+            record(res, f"[{i}/{len(todo)}{eta}] ")
             if res.outcome in ("committed", "removed"):
                 changed += 1
                 if args.limit and changed >= args.limit:
                     stopped = f"--limit {args.limit} reached; re-run with --resume to continue"
                     break
+            # The same permission error everywhere means the token, not the repos: stop instead of
+            # spending the budget on every remaining repo.
+            if res.outcome == "failed" and res.detail.startswith("HTTP 403"):
+                same_403 = same_403 + 1 if res.detail == last_403 else 1
+                last_403 = res.detail
+                if same_403 >= 10:
+                    stopped = f"the same error on 10 repositories in a row ({res.detail}); fix the token, " \
+                              "then re-run with --resume"
+                    break
+            elif res.outcome in TERMINAL:  # skipped repos neither break nor extend the streak
+                same_403, last_403 = 0, ""
     except KeyboardInterrupt:
         stopped = "interrupted; re-run with --resume to continue"
     report.close()
-    print_summary(results)
-    print(f"API calls: {gh.calls}")
+    print_summary(counts)
+    print_api_summary(gh, sum(counts.values()), time.monotonic() - started)
     if stopped:
         print(f"Stopped: {stopped}", file=sys.stderr)
         if "token" in stopped:
             return 3
         if "interrupted" in stopped:
             return 130
-    return 0 if all(r.outcome in TERMINAL for r in results) else 1
+    return 0 if all_done else 1
 
 
 def run_file(args, cli_cfg: dict) -> int:
@@ -2168,10 +2864,7 @@ def print_result(res: Result, dry: bool, quiet: bool = False, prefix: str = "") 
         print(f"   branch: {res.url}")
 
 
-def print_summary(results: list[Result]) -> None:
-    counts: dict[str, int] = {}
-    for r in results:
-        counts[r.outcome] = counts.get(r.outcome, 0) + 1
+def print_summary(counts: Counter) -> None:
     print("\nSummary: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
 
 
@@ -2223,8 +2916,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--report", metavar="CSV", help="CSV report, written row by row (targets only)")
     p.add_argument("--resume", action="store_true", help="with --report: skip repos already done in that report and append")
     p.add_argument("--limit", type=int, metavar="N", help="stop after changing N repositories (canary rollouts)")
+    p.add_argument("--token-command", metavar="CMD",
+                   help="command that prints a GitHub token; run at start and again if the token expires "
+                        "(GitHub App installation tokens last 1 hour)")
+    p.add_argument("--writes-per-hour", type=int, metavar="N",
+                   help=f"content-creating API requests per hour (default {GitHub.WRITES_PER_HOUR}, GitHub's "
+                        "documented secondary limit; each changed repo uses 2)")
     p.add_argument("--quiet", action="store_true", help="one line per repository")
-    p.add_argument("--debug", action="store_true", help="print tracebacks for internal errors")
+    p.add_argument("--debug", action="store_true",
+                   help="log every API request (method, path, status, time, budget; never the token) and print "
+                        "tracebacks for internal errors")
     p.add_argument("--source-dir", help="repo root for language detection (--file only; default: the file's repo)")
     p.add_argument("--out", help="write here instead of in place (--file only)")
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -2240,6 +2941,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.resume and not args.report:
         print("error: --resume needs --report", file=sys.stderr)
+        return 2
+    if args.writes_per_hour is not None and args.writes_per_hour < 1:
+        print("error: --writes-per-hour must be at least 1", file=sys.stderr)
         return 2
     if args.limit is not None and args.limit < 1:
         print("error: --limit must be at least 1", file=sys.stderr)
