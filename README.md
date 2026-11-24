@@ -126,12 +126,15 @@ Real output: a dry run against two public repositories (no admin access, so secr
    TODO  Make sure these Actions secrets exist: VERACODE_API_ID, VERACODE_API_KEY, SRCCLR_API_TOKEN (https://docs.veracode.com/r/t_create_api_creds)
    TODO  Check the build output path in step "Upload build output for Veracode" (job `build`): it uses the .NET build defaults. Packaging guide: https://docs.veracode.com/r/compilation_packaging
 
-== spring-projects/spring-petclinic: skipped (several candidate workflows (.github/workflows/gradle-build.yml, .github/workflows/maven-build.yml); set `workflow` in the config or --workflow)
+== spring-projects/spring-petclinic: would_change
    SAST  on   languages: Java
    SCA   on   manifests: build.gradle, pom.xml, settings.gradle (java)
    IaC   on   artifacts: Dockerfile, docker-compose.yml, k8s/db.yml, k8s/petclinic.yml
+   workflow: .github/workflows/gradle-build.yml | SAST binary (build: Gradle) [pipeline+policy] | SCA on | IaC on
+   ...
+   INFO  note: Workflow gradle-build.yml picked over maven-build.yml; set `workflow` to change it
 
-Summary: skipped 1, would_change 1
+Summary: would_change 2
 ```
 
 The diff it shows for GitHub's Maven starter workflow (excerpt):
@@ -189,6 +192,19 @@ Repository or organization secrets both work. Fork PRs don't receive secrets, so
 4. Open a PR from the branch into the default branch. The PR run executes the selected PR scans: the Pipeline Scan gate and/or the sandbox scan, plus SCA.
 5. Check the **Veracode SAST prepare** log for packaging warnings, then merge. The first push to the default branch runs the policy scan.
 
+## Rolling out to a large org
+
+1. **See what fits:** `--detect-only --report scans.csv`. Check the SAST/SCA/IaC decisions and reasons, and fix exceptions in the config (`repos:`).
+2. **Dry run:** `--dry-run --no-diff --quiet --report plan.csv`. Skipped rows say why (existing Veracode steps, only reusable workflows, Actions policy). The `notes` column shows where the tool picked between equally likely workflows or build jobs; review those, or use `--strict` to skip them instead.
+3. **Canary:** `--limit 20 --report rollout.csv`. This changes the first 20 repos only. Open a PR in a few of them and check the runs.
+4. **Everything else:** `--report rollout.csv --resume --quiet`. Repos already done in the report are skipped, and new rows are appended.
+
+- **Resume:** the report is written row by row. If a run is interrupted (Ctrl+C, network failure, or an expired token, which exits with code 3), re-run the same command with `--resume`.
+- **Rate limits:** the tool waits for the hourly limit to reset instead of failing, and pauses between writes to stay under GitHub's secondary rate limit.
+- **API budget:** about 10–15 calls per repo, plus 2 writes per changed repo; `--detect-only` uses about 4. A personal access token gets 5,000 calls an hour, which is roughly 400 repos an hour. A GitHub App installation token on GitHub Enterprise Cloud gets up to 15,000. The summary prints the API calls used.
+- **Branch safety:** an existing branch is only updated when every commit on it came from this tool, and its workflow matches the default branch outside the managed blocks. Otherwise the repo is skipped with the reason, and `--force` overrides. Nothing is ever written to the default branch.
+- **Per-repo isolation:** a failure in one repo is recorded in the report and the run continues.
+
 ## Targets and flags
 
 | Target | Meaning |
@@ -220,9 +236,14 @@ Repository or organization secrets both work. Fork PRs don't receive secrets, so
 | `--config` | | YAML file with defaults and per-repo overrides |
 | `--pin-sha` | off | Pin the actions to commit SHAs (targets only) |
 | `--remove` | off | Remove the managed blocks |
+| `--strict` | off | Skip repos where several workflows or build jobs rank equally, instead of picking the first and noting it |
 | `--force` | off | Overwrite hand-edited managed blocks, or add the jobs next to existing Veracode steps |
 | `--exclude`, `--include-forks` | | Filter the repositories that an org or pattern target matches |
-| `--report` | | CSV report of every repository with plan, TODOs and the reason for each scan (targets only) |
+| `--report` | | CSV report of every repository with plan, TODOs and the reason for each scan, written row by row (targets only) |
+| `--resume` | off | With `--report`: skip repositories already completed in that report and append to it |
+| `--limit` | | Stop after changing N repositories (canary) |
+| `--quiet` | off | One line per repository |
+| `--debug` | off | Print the traceback for internal errors |
 | `--source-dir`, `--out` | | Local mode: repo root for detection, and output file |
 
 ### Config file
@@ -259,17 +280,24 @@ Command-line flags override the config.
 | 0 | Every repository was committed, is already up to date, would change (dry run) or was detected (`--detect-only`) |
 | 1 | At least one repository was skipped or failed. The output says why. |
 | 2 | Usage, config or detection error |
-| 3 | GitHub API error, such as authentication or no access |
+| 3 | GitHub API error: authentication failed, or the token expired mid-run (re-run with `--resume`) |
+| 130 | Interrupted (Ctrl+C). Re-run with `--resume`. |
 
 ## Troubleshooting
 
 | What you see | Why | Fix |
 |---|---|---|
-| `skipped (several candidate workflows ...)` | More than one workflow builds the code | `--workflow ci.yml`, or `workflow:` per repo in the config |
-| `skipped (several jobs build the code ...)` | More than one job in the workflow builds the code | `--build-job <id>`, or `build_job:` in the config |
+| `note: Workflow X picked over Y` | Several workflows ranked equally; the tool took the first | Check it on the branch. `workflow:` per repo in the config changes it. |
+| `note: Build job X picked over Y` | Several jobs build the code (for example one per OS); Linux and non-release jobs win | `build_job:` in the config changes it |
+| `skipped (several candidate workflows ...)` / `(several jobs ...)` | Same as the two notes, with `--strict` | `--workflow ci.yml` / `--build-job <id>`, or per repo in the config |
+| `skipped (only reusable workflows ...)` | The push/PR workflows are `workflow_call` workflows, which only get the secrets their callers pass | `workflow:` set to the caller workflow |
 | `skipped (already runs Veracode in ...)` | The repo already has Veracode steps | Keep them, or use `--force` to add the managed jobs as well |
 | `skipped (a managed block was edited by hand ...)` | Someone changed a block on the branch, for example its `path:` | That edit is kept. Use `--force` to regenerate the block. |
 | `token scopes ... cannot write workflow files` | The token is missing `workflow` | `gh auth refresh -s workflow` |
+| `branch ... has N commit(s) not made by this tool` | Someone already uses `veracode/integration` for other work | `--branch veracode/scans` (or another name), or `--force` to add to it |
+| `... differs from main outside the managed blocks` | The workflow changed on the default branch after the tool's branch was made, or someone edited the branch | Merge the default branch into the tool's branch, delete the branch, or `--force` to rebuild it from the default branch |
+| `failed (repository not found or no access)` | A misspelled `org/repo`, or the token can't see it | Fix the target. The rest of the run continues. |
+| `Stopped: GitHub rejected the token` | The token expired (GitHub App tokens last 1 hour) | Get a new token and re-run with `--resume` |
 | `FAIL actions policy: only local actions allowed` | The org or repo policy blocks marketplace actions | Allow `actions/*` and `veracode/*` in **Settings > Actions > General** |
 | Packaging warning `No scannable build output found` | The upload path matched nothing | Fix `path:` in **Upload build output for Veracode** |
 | Packaging warning `No .pdb files` | .NET built without symbols | Publish with portable PDBs ([.NET packaging](https://docs.veracode.com/r/compilation_net)) |

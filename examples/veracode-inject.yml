@@ -15,6 +15,7 @@ defaults:
   sca_blocking: false
   iac_blocking: false
   retention_days: 3
+  strict: false                        # true: skip repos with tied workflows/build jobs instead of picking
 
 # Per-repo overrides: glob on org/repo, later matches win.
 repos:

@@ -66,7 +66,7 @@ Detection runs first, on the default branch, before any workflow is read. `--det
 | `--workflow` / `workflow:` | That file. Matching zero or several files skips the repo. |
 | A file that already has managed blocks | That file, so a re-run updates it |
 | Another workflow already uses Veracode | Skip, unless `--force` |
-| Otherwise | Files triggered by `push` or `pull_request`. The tool prefers, in order: not a CodeQL/release/deploy/docs/lint workflow, contains the build (for compiled languages), has build or test jobs, has both triggers, and has a common name (`ci`, `build`, `maven`, ...). A tie skips the repo and lists the candidates. |
+| Otherwise | Files triggered by `push` or `pull_request`, excluding reusable (`workflow_call`) workflows, which only get the secrets their callers pass. The tool prefers, in order: not a utility workflow (CodeQL, release, deploy, docs, lint, translations, Copilot setup, dependency review, OS- or tool-specific checks, ...), contains the build (for compiled languages), has build or test jobs, has both triggers, has a CI-like name (`ci`, `build`, `test`, `maven`, ...), and runs on Linux. On a tie it picks the one with the most build/test jobs, then the first by name, and adds a note. `--strict` skips instead. |
 
 ## 3. Finding the build
 
@@ -81,7 +81,7 @@ Detection runs first, on the default branch, before any workflow is read. `--det
 | Native | `make`, `cmake --build`, `ninja` | No default. A `TODO-set-your-build-output-path` placeholder goes in, plus a TODO. |
 
 - Jobs that call reusable workflows (`uses:` at job level) are skipped, because steps can't be added to them.
-- If several jobs build the code, the tool prefers a job named `build`/`package`/`compile`/`ci` that has no job-level `if:`. If that still leaves more than one, the repo is skipped until `build_job` is set.
+- If several jobs build the code, the tool prefers a job named `build`/`package`/`compile`/`ci`, then one without a job-level `if:`, then one on Linux, then one that isn't a release/deploy job. A remaining tie takes the first in the file and adds a note (`--strict` skips instead); `build_job` sets it.
 - Inside the build job, the **last** matching step counts, so `dotnet publish` after `dotnet build` wins.
 - If the job already uploads an artifact after the build (one that isn't a test report or log), the tool downloads that artifact instead of adding its own upload step.
 - Matrix builds: every leg uploads `veracode-build-<job-index>`. The prepare job merges them, so files with the same name are scanned once.
@@ -131,6 +131,18 @@ The value at the end is a hash of the block's content.
 
 Line endings (LF/CRLF), indentation, comments and anchors in the client's file aren't changed. Only whole lines are inserted.
 
+## Branch rules
+
+| Situation | What the tool does |
+|---|---|
+| Branch doesn't exist | Creates it from the head of the default branch and commits the workflow change |
+| Branch exists; all its commits are from this tool; workflow matches the default branch outside the managed blocks | Regenerates the blocks. No commit if nothing changed. |
+| Branch has commits from anyone else | Skips the repo (`--force` adds to the branch anyway) |
+| Workflow on the branch differs from the default branch outside the managed blocks | Skips the repo. `--force` rebuilds the file from the default branch's version. |
+| A managed block was edited on the branch | Skips the repo so the edit survives (`--force` regenerates the block) |
+| Branch name equals the default branch, or is not a valid ref | Skips the repo. Nothing is ever written to the default branch. |
+| Branch created by someone else during the run, or the file changed between read and write | Marks the repo `failed`; re-running fixes it |
+
 ## 6. Pre-checks (`--dry-run` shows them)
 
 | Check | PASS | WARN / FAIL |
@@ -150,7 +162,7 @@ All come from read-only `--dry-run` / `--detect-only` runs against public reposi
 | `dotnet-architecture/eShopOnWeb` | `dotnetcore.yml` | SAST binary after job `build` (`dotnet build`), SCA, IaC | C# with a `dotnet build` step. The `wwwroot` JS has no `package.json`, so no source zip. |
 | `gin-gonic/gin` | `gin.yml` | SAST source after job `test`, SCA, IaC | Go is a source language. `trivy-scan.yml` also runs on push, but `gin.yml` has a test job. |
 | `juice-shop/juice-shop` | `ci.yml` | SAST source after job `frontend-test`, SCA, IaC | TypeScript. A test job is preferred over `lint`. |
-| `spring-projects/spring-petclinic` | skipped | Two equal candidates: `gradle-build.yml` and `maven-build.yml` | Pick one with `--workflow maven-build.yml`, which gives SAST binary (Maven) on a matrix build job |
+| `spring-projects/spring-petclinic` | `gradle-build.yml` | SAST binary after job `build` (Gradle), SCA, IaC | `gradle-build.yml` and `maven-build.yml` tie; the first by name wins with a note. `--workflow maven-build.yml` picks the Maven one. |
 | `ShareX/ShareX` | detection only | SAST, SCA on `windows-latest`, IaC | `App.xaml` triggered a project-file read, and `ShareX.HelpersLib.csproj` targets Windows |
 | `flutter-team-archive/gallery` | detection only | SAST for the Ruby (fastlane) scripts, no SCA, IaC | Dart has no Pipeline Scan support. The `android/` and `ios/` scaffolding is ignored, and `pubspec.yaml` isn't an SCA manifest here. |
 | `terraform-aws-modules/terraform-aws-vpc` | detection only | IaC only | Only HCL, so no SAST and no SCA |
